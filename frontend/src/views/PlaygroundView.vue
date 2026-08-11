@@ -47,9 +47,8 @@ const fileInput = ref(null)
 // user's recent finished results from the server.
 const tasks = ref([])
 const history = ref([])
-// Gateway-timeout statuses our BACKEND never emits — a CDN/proxy (e.g. EdgeOne
-// 524) gave up waiting while the synchronous /generate is STILL rendering. The
-// task stays "running" and loadHistory() claims it once the result lands.
+// Gateway-timeout statuses can occur for synchronous video requests. Image
+// clicks create a server-side job immediately and history polling claims it.
 const GATEWAY_TIMEOUT = new Set([0, 408, 504, 520, 521, 522, 523, 524, 525])
 const error = ref('')
 const lightbox = ref(null)
@@ -568,6 +567,7 @@ async function fireOne() {
     duration: mode.value === 'video' ? (perSecondRate.value ? secs.value + 's' : duration.value) : '',
     deai: mode.value === 'image' && deaiEnabled.value ? deai.value : false,
     status: 'pending',
+    serverId: '',
     url: '',
     error: '',
     elapsed_ms: 0,
@@ -602,7 +602,10 @@ async function fireOne() {
 
   try {
     const r = await api('/generate', opts)
-    if (r.ok && r.data?.url) {
+    if (r.ok && r.data?.status === 'pending') {
+      task.status = 'running'
+      task.serverId = r.data.id || ''
+    } else if (r.ok && r.data?.url) {
       task.status = 'done'
       task.url = r.data.url
       task.elapsed_ms = r.data.elapsed_ms
@@ -629,33 +632,35 @@ async function fireOne() {
   loadHistory()
 }
 
-// Fill the grid up to 10 with the user's recent rows (进行中 + 成功). Past
-// FAILURES are never shown from history — an error is only relevant for the live
-// generation the user just ran. Prune optimistic tasks the server now tracks.
+// Fill the grid up to 10 with the user's recent rows (进行中 + 成功 + 失败). Past
+// History owns image jobs after their immediate creation response. Keep failed
+// jobs visible so background upstream failures remain actionable.
 let prevPending = 0
 async function loadHistory() {
-  // Server-side filter: status IN (pending, success), newest 12 — exactly the
-  // rows the grid shows, in one query (no client over-fetch).
-  const r = await api('/logs?limit=10&statuses=pending,success&source=user&exclude_showcase=1&media=1')
+  const r = await api('/logs?limit=10&statuses=pending,success,failed&source=user&exclude_showcase=1&media=1')
   if (!r.ok) return
   history.value = (r.data?.data || [])
-    .filter((e) => e.status === 'pending' || e.file)
+    .filter((e) => e.status === 'pending' || e.status === 'success' || e.status === 'failed')
     .map((e) => ({
       id: 'srv-' + e.id,
+      eventId: e.id,
       prompt: e.prompt, model: e.model, kind: e.kind,
       ratio: e.ratio, resolution: e.resolution, duration: e.duration, deai: !!e.deai,
-      status: e.status === 'success' ? 'done' : 'running',
-      url: e.file ? generatedUrl(e.file) : '',
-      error: '',
+      status: e.status === 'success' ? 'done' : (e.status === 'failed' ? 'failed' : 'running'),
+      url: e.status === 'success' && e.file ? generatedUrl(e.file) : '',
+      error: e.status === 'failed' ? (e.error || '生成失败') : '',
       elapsed_ms: e.elapsed_ms,
     }))
   // Hand each optimistic task over to the server once it's tracked there: drop a
-  // pending task when a matching server pending row exists, a done task once its
-  // file is in the server's rows. A FAILED task is a live error — keep it.
+  // Pending task when a matching server pending row exists, and terminal task
+  // once the server wrote its success or failure status.
   const serverPending = new Set(history.value.filter((h) => h.status === 'running').map(taskKey))
   const serverFiles = new Set(history.value.filter((h) => h.url).map((h) => fileKey(h.url)))
+  const serverFailures = new Set(history.value.filter((h) => h.status === 'failed').map(taskKey))
+  const serverEventIDs = new Set(history.value.map((h) => h.eventId))
   tasks.value = tasks.value.filter((t) => {
-    if (t.status === 'failed') return true
+    if (t.serverId) return !serverEventIDs.has(t.serverId)
+    if (t.status === 'failed') return !serverFailures.has(taskKey(t))
     if (t.status === 'done') return !serverFiles.has(fileKey(t.url))
     return !serverPending.has(taskKey(t))
   })
