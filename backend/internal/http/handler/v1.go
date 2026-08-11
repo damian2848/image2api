@@ -58,8 +58,9 @@ func (h *V1Handler) UserBalance(c *gin.Context) {
 }
 
 // ImageGenerations — OpenAI POST /v1/images/generations (text-to-image only).
-// Accepts exactly OpenAI's fields; size→aspect ratio and quality→resolution tier
-// are mapped server-side. Returns {created, data:[{b64_json}]}.
+// Supports either a legacy size (WxH) or image_size + aspect_ratio. Explicit
+// image_size / aspect_ratio values take precedence over values inferred from size.
+// Returns {created, data:[{b64_json}]}.
 func (h *V1Handler) ImageGenerations(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
@@ -72,6 +73,8 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 		Prompt         string `json:"prompt"`
 		N              int    `json:"n"`
 		Size           string `json:"size"`
+		ImageSize      string `json:"image_size"`
+		AspectRatio    string `json:"aspect_ratio"`
 		Quality        string `json:"quality"`
 		ResponseFormat string `json:"response_format"`
 		Background     string `json:"background"`
@@ -84,11 +87,13 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 	}
 
 	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, service.V1ImageRequest{
-		Model:   body.Model,
-		Prompt:  body.Prompt,
-		N:       body.N,
-		Size:    body.Size,
-		BaseURL: requestBaseURL(c),
+		Model:       body.Model,
+		Prompt:      body.Prompt,
+		N:           body.N,
+		Size:        body.Size,
+		Resolution:  body.ImageSize,
+		AspectRatio: body.AspectRatio,
+		BaseURL:     requestBaseURL(c),
 	})
 	if err != nil {
 		h.writeV1Error(c, err, resp)
@@ -98,8 +103,9 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 }
 
 // ImageEdits — OpenAI POST /v1/images/edits (image-to-image). multipart/form-data
-// only: image / image[] file uploads (+ optional mask), prompt, model, n, size,
-// quality. Files become reference images. Returns {created, data:[{b64_json}]}.
+// only: image / image[] file uploads (+ optional mask), prompt, model, n, and
+// either size or image_size + aspect_ratio. Files become reference images.
+// Returns {created, data:[{b64_json}]}.
 func (h *V1Handler) ImageEdits(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
@@ -125,6 +131,8 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		Prompt:          c.PostForm("prompt"),
 		N:               n,
 		Size:            c.PostForm("size"),
+		Resolution:      c.PostForm("image_size"),
+		AspectRatio:     c.PostForm("aspect_ratio"),
 		ReferenceImages: refs,
 		BaseURL:         requestBaseURL(c),
 	})
