@@ -50,6 +50,11 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 	engine.GET("/images/:user/:name", handlers.Images.Serve)
 	engine.GET("/v1/models", handlers.V1.Models)
 	engine.POST("/v1/images/generations", handlers.V1.ImageGenerations)
+	// GPT Image 2-style async jobs. Keep the second path for clients that use
+	// the documented compatibility alias.
+	engine.POST("/v1/images/async/generations", handlers.V1.AsyncImageGenerations)
+	engine.POST("/v1/images/generations/async", handlers.V1.AsyncImageGenerations)
+	engine.GET("/v1/images/async/:task_id", handlers.V1.GetAsyncImage)
 	engine.POST("/v1/images/edits", handlers.V1.ImageEdits)
 	// OpenAI Sora-style async video: create job → poll → stream content.
 	engine.POST("/v1/videos", handlers.V1.CreateVideo)

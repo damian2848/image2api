@@ -90,9 +90,9 @@
 - **去AI特征**(可选):画图台一键开启,生成图片自动做去AI痕迹处理(细节微扰 + 去除元数据),按画质档位加收积分(默认 1K+1 / 2K+2 / 4K+3,后台可改价、可整体关闭);带标记的作品在画图台、创作记录、日志与后台图片管理中均有「去AI特征」标识
 
 #### 🔌 OpenAI 兼容
-- 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`
-- **严格 OpenAI 入参**:`size` **同时决定比例 + 分辨率档**(图像看长边 → 1K/2K/4K,视频看短边 → 720p/1080p),改个 `base_url` + `api_key` 即接现有 OpenAI SDK
-- 图片结果 **base64 直返**,服务端不留存文件,隐私友好;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
+- 文生图 `/v1/images/generations` · 异步图片 `/v1/images/async/generations` → 轮询 `/v1/images/async/{task_id}` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`
+- 图像支持 `image_size`(1K/2K/4K) + `aspect_ratio` 与 `image` 公网参考图 URL 数组;旧 `size`(WxH)仍可用。视频 `size` 按短边映射 720p/1080p
+- 图片结果返回 URL；站内 **/docs** 附完整同步、异步和分辨率示例
 
 #### 🔁 多账号池 + 智能故障转移
 - 账号池调度,单账号出错不影响整体
@@ -151,7 +151,7 @@
 ## 🔌 OpenAI 兼容 API
 
 ```bash
-# 文生图 —— 推荐 image_size + aspect_ratio；也兼容旧 size(WxH)格式
+# 同步图片 —— 推荐 image_size + aspect_ratio；image 可传公网参考图 URL 数组
 curl https://你的域名/v1/images/generations \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Content-Type: application/json" \
@@ -159,8 +159,17 @@ curl https://你的域名/v1/images/generations \
     "model": "gpt-image-2",
     "prompt": "a cute cat on a desk, studio lighting",
     "image_size": "2K",
-    "aspect_ratio": "16:9"
+    "aspect_ratio": "16:9",
+    "image": ["https://example.com/reference-cat.png"]
   }'
+
+# 异步图片 —— 返回 {"data":{"task_id":"..."}}；轮询到 SUCCESS 后读取 data.result_url
+curl https://你的域名/v1/images/async/generations \
+  -H "Authorization: Bearer sk-xxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-image-2","prompt":"a cinematic wheat field","image_size":"2K","aspect_ratio":"16:9"}'
+# 兼容路径: POST /v1/images/generations/async
+# GET /v1/images/async/{task_id} → data.status: PENDING / SUCCESS / FAILED
 
 # 图生图 —— multipart 上传参考图(可多张 image[])
 curl https://你的域名/v1/images/edits \
@@ -168,7 +177,7 @@ curl https://你的域名/v1/images/edits \
   -F model="seedream-4.5" -F prompt="改成赛博朋克风格" -F image=@input.png
 ```
 
-图片返回 OpenAI 风格 `{ "created": ..., "data": [{ "b64_json": "..." }] }`(原始 base64,无 `data:` 前缀,服务端不留存)。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
+同步图片返回 OpenAI 风格 `{ "created": ..., "data": [{ "url": "..." }] }`。异步图片提交返回 `{ "data": { "task_id": "..." } }`，轮询结果在成功时提供 `data.result_url`。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
 
 ## 🚀 部署
 

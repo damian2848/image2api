@@ -289,7 +289,7 @@ func (h *UserGenerationHandler) Logs(c *gin.Context) {
 	if user.Role == "admin" && c.Query("scope") == "all" {
 		userID = ""
 	}
-	// 来源筛选: "v1" = API key, "user" = 前台画图, "admin" = 测试模型. 始终生效 ——
+	// 来源筛选: "v1" = API key(含异步图片), "user" = 前台画图, "admin" = 测试模型. 始终生效 ——
 	// 普通用户已被 userID 限定为本人记录,按来源服务端筛选 + 分页(/mylogs 翻全部历史)。
 	source := c.Query("source")
 	// 创作记录 gallery passes has_file=1 so server-side pagination counts only

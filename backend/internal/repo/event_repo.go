@@ -24,8 +24,8 @@ type EventListFilter struct {
 	UserID        string
 	UserIDs       []string // when set, keep ONLY rows whose user_id is in this list (admin 用户搜索)
 	Query         string   // free-text search over prompt / model / error (server-side, 跨页)
-	ExcludeSource string // when set, omit rows with this source (e.g. hide API-key "v1" usage from the customer logs page)
-	Source        string // when set, keep ONLY rows with this source (admin 来源 filter): "v1" (API key) / "user" (前台) / "admin" (测试模型)
+	ExcludeSource string   // when set, omit rows with this source ("v1" also omits async API image jobs)
+	Source        string   // when set, keep ONLY rows with this source ("v1" includes async API image jobs)
 	HasFile       bool     // when true, keep ONLY rows with a non-empty file (the 创作记录 gallery — paginates over real media)
 	ExcludeFiles  []string // when set, omit rows whose file is in this list (e.g. hide homepage showcase media from user galleries)
 	MediaOnly     bool     // when true, keep only rows that are pending or have a stored file — the 画图台 grid, so deleted works don't eat a slot
@@ -68,10 +68,14 @@ func (r *EventRepository) List(ctx context.Context, filter EventListFilter) ([]m
 		like := "%" + term + "%"
 		q = q.Where("(prompt ILIKE ? OR model ILIKE ? OR error ILIKE ?)", like, like, like)
 	}
-	if filter.ExcludeSource != "" {
+	if filter.ExcludeSource == "v1" {
+		q = q.Where("(source IS NULL OR source NOT IN ?)", []string{"v1", "v1_async"})
+	} else if filter.ExcludeSource != "" {
 		q = q.Where("(source IS NULL OR source <> ?)", filter.ExcludeSource)
 	}
-	if filter.Source != "" {
+	if filter.Source == "v1" {
+		q = q.Where("source IN ?", []string{"v1", "v1_async"})
+	} else if filter.Source != "" {
 		q = q.Where("source = ?", filter.Source)
 	}
 	if filter.HasFile {
@@ -484,7 +488,7 @@ func (r *EventRepository) Create(ctx context.Context, item *model.EventLog) erro
 	} else if item.Kind == "image" {
 		deltas["image"] = 1
 	}
-	if item.Source == "v1" {
+	if item.Source == "v1" || item.Source == "v1_async" {
 		deltas["api"] = 1
 	}
 	r.incrCounters(ctx, deltas)
