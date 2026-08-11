@@ -3,6 +3,7 @@ package service
 import (
 	"net/netip"
 	"testing"
+	"time"
 
 	"backend/internal/model"
 )
@@ -62,6 +63,30 @@ func TestAsyncImageStatus(t *testing.T) {
 				t.Fatalf("asyncImageStatus(%q) = %q, want %q", tt.status, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAsyncImageSuccessResponseUsesOpenAIShape(t *testing.T) {
+	ev := &model.EventLog{
+		ID:       "evt-IMAGE123",
+		Status:   "success",
+		Provider: "adobe",
+		File:     "https://images.example.test/result.png",
+		TS:       time.Unix(1_786_431_287, 0),
+	}
+	response, err := asyncImageSuccessResponse(ev, "https://api.example.test")
+	if err != nil {
+		t.Fatalf("asyncImageSuccessResponse returned error: %v", err)
+	}
+	if got, want := response["created"], ev.TS.Unix(); got != want {
+		t.Fatalf("created = %v, want %d", got, want)
+	}
+	data, ok := response["data"].([]map[string]any)
+	if !ok || len(data) != 1 || data[0]["url"] != ev.File {
+		t.Fatalf("data = %#v, want one OpenAI image URL", response["data"])
+	}
+	if _, ok := response["status"]; ok {
+		t.Fatalf("successful OpenAI response must not include a task status")
 	}
 }
 
