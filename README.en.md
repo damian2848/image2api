@@ -155,13 +155,13 @@ curl https://your-domain/v1/images/generations \
     "image": ["https://example.com/reference-cat.png"]
   }'
 
-# Async image — returns {"data":{"task_id":"..."}}; read data.result_url after SUCCESS
+# Async image — returns {"data":{"task_id":"..."}}; successful polling is normalized to an OpenAI image response
 curl https://your-domain/v1/images/async/generations \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-image-2","prompt":"a cinematic wheat field","image_size":"2K","aspect_ratio":"16:9"}'
 # Compatibility path: POST /v1/images/generations/async
-# GET /v1/images/async/{task_id} → data.status: PENDING / SUCCESS / FAILED
+# GET /v1/images/async/{task_id} → pending/failed: data.status is PENDING/FAILED; success: {"created":...,"data":[{"url":"..."}]}
 
 # Image-to-image — multipart reference upload (multiple via image[])
 curl https://your-domain/v1/images/edits \
@@ -169,7 +169,7 @@ curl https://your-domain/v1/images/edits \
   -F model="seedream-4.5" -F prompt="make it cyberpunk" -F image=@input.png
 ```
 
-Synchronous images return OpenAI-style `{ "created": ..., "data": [{ "url": "..." }] }`. Async image submission returns `{ "data": { "task_id": "..." } }`; successful polls provide `data.result_url`. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
+Synchronous images return OpenAI-style `{ "created": ..., "data": [{ "url": "..." }] }`. Async image submission returns `{ "data": { "task_id": "..." } }`; pending and failed polls include `data.status`, while successful polls use the same OpenAI image response. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
 
 ## 🚀 Deployment
 

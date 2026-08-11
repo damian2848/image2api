@@ -763,32 +763,39 @@ func (s *V1Service) StartAsyncImageRequest(ctx context.Context, principal *APIPr
 	}
 }
 
-// AsyncImageJob returns the GPT Image 2-style task state for an API image
-// request. Task IDs are scoped to the API key owner so they cannot be guessed
-// and read by another account.
+// AsyncImageJob returns the task state for an API image request. Pending and
+// failed tasks use the task envelope; a completed task is normalized to the
+// same OpenAI image response as the synchronous endpoint.
 func (s *V1Service) AsyncImageJob(ctx context.Context, principal *APIPrincipal, id, baseURL string) (map[string]any, error) {
 	ev, err := s.asyncImageEventForUser(ctx, principal, id)
 	if err != nil {
 		return nil, err
 	}
+	if ev.Status == "success" {
+		return asyncImageSuccessResponse(ev, baseURL)
+	}
 	data := map[string]any{
 		"task_id": ev.ID,
 		"status":  asyncImageStatus(ev),
 	}
-	switch ev.Status {
-	case "success":
-		if strings.TrimSpace(ev.File) == "" {
-			return nil, ErrImageNotReady
-		}
-		resultURL := ev.File
-		if ev.Provider == "chatgpt" || strings.HasPrefix(ev.File, asyncImageStoragePrefix) {
-			resultURL = imageContentURL(baseURL, ev.ID)
-		}
-		data["result_url"] = resultURL
-	case "failed":
+	if ev.Status == "failed" {
 		data["error"] = strings.TrimSpace(ev.Error)
 	}
 	return map[string]any{"data": data}, nil
+}
+
+func asyncImageSuccessResponse(ev *model.EventLog, baseURL string) (map[string]any, error) {
+	if ev == nil || strings.TrimSpace(ev.File) == "" {
+		return nil, ErrImageNotReady
+	}
+	resultURL := ev.File
+	if ev.Provider == "chatgpt" || strings.HasPrefix(ev.File, asyncImageStoragePrefix) {
+		resultURL = imageContentURL(baseURL, ev.ID)
+	}
+	return map[string]any{
+		"created": ev.TS.Unix(),
+		"data":    []map[string]any{{"url": resultURL}},
+	}, nil
 }
 
 func (s *V1Service) asyncImageEventForUser(ctx context.Context, principal *APIPrincipal, id string) (*model.EventLog, error) {
