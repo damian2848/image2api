@@ -12,6 +12,8 @@ sudo ./ops/updater/install.sh /opt/image2api
 sudoedit /etc/image2api/updater.env
 ```
 
+安装器会仅将指定部署目录加入 Git 的系统级安全目录白名单，使拥有 Docker 权限的更新器能够操作由普通部署用户维护的仓库。
+
 在 `/etc/image2api/updater.env` 中设置随机密钥，并确认仓库与 Compose 文件：
 
 ```dotenv
