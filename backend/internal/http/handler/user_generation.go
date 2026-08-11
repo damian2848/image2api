@@ -25,10 +25,10 @@ func NewUserGenerationHandler(userGen *service.UserGenerationService, admin *ser
 	}
 }
 
-// /generate 是同步长请求(视频要跑好几分钟)。等待期间连接一旦被重置(CDN 回源
-// 超时 / HTTP2 GOAWAY),浏览器会把还没拿到响应的 POST 透明重发,后端就会再生成
-// 一次、再扣一次积分。前端为每个任务带一个 Idempotency-Key,同一个 key 只真正
-// 执行一次:原任务还在跑就直接拒绝,已经跑完就把原结果返回。
+// /generate 的图片请求会立即返回任务，视频仍可能持续数分钟。连接被重置时
+// (CDN 回源超时 / HTTP2 GOAWAY)，浏览器可能透明重发 POST；前端为每个任务
+// 带 Idempotency-Key，同一个 key 只真正执行一次：原任务还在跑就直接拒绝，
+// 已经响应过则返回同一份结果。
 const idemTTL = 10 * time.Minute
 
 type idemEntry struct {
@@ -143,7 +143,7 @@ func (h *UserGenerationHandler) Generate(c *gin.Context) {
 		defer func() { h.idem.finish(key, generated) }()
 	}
 
-	resp, err := h.userGen.Generate(c.Request.Context(), user, service.UserGenerateRequest{
+	resp, err := h.userGen.Start(c.Request.Context(), user, service.UserGenerateRequest{
 		Model:           body.Model,
 		Prompt:          body.Prompt,
 		Ratio:           body.Ratio,

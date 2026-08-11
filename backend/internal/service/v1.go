@@ -763,6 +763,32 @@ func (s *V1Service) StartAsyncImageRequest(ctx context.Context, principal *APIPr
 	}
 }
 
+// StartSessionImageJob creates a stored image job for the drawing board and
+// returns as soon as the event is durable. The worker continues through the
+// same session path, so storage, concurrency limits, charging, and refunds are
+// unchanged from the previous synchronous request.
+func (s *V1Service) StartSessionImageJob(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
+	started := make(chan string, 1)
+	finished := make(chan error, 1)
+	go func() {
+		_, err := s.prepareImageExecutionWithStart(ctx, principal, in, "user", true, func(eventID string) {
+			started <- eventID
+		})
+		finished <- err
+	}()
+
+	select {
+	case eventID := <-started:
+		return map[string]any{
+			"id":      eventID,
+			"status":  "pending",
+			"created": time.Now().Unix(),
+		}, nil
+	case err := <-finished:
+		return nil, err
+	}
+}
+
 // AsyncImageJob returns the task state for an API image request. Pending and
 // failed tasks use the task envelope; a completed task is normalized to the
 // same OpenAI image response as the synchronous endpoint.

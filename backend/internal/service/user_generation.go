@@ -95,6 +95,33 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 	}
 }
 
+// Start returns immediately for drawing-board image generation after its event
+// row is created. Videos retain the synchronous path because their UI response
+// and content delivery contract is different.
+func (s *UserGenerationService) Start(ctx context.Context, user *model.User, in UserGenerateRequest) (map[string]any, error) {
+	if user == nil || strings.TrimSpace(user.ID) == "" {
+		return nil, errors.New("未登录或会话已过期")
+	}
+	modelItem, err := s.models.Get(ctx, strings.TrimSpace(in.Model))
+	if err != nil {
+		return nil, ErrUnknownModel
+	}
+	if modelItem.Type != "image" {
+		return s.Generate(ctx, user, in)
+	}
+	return s.v1.StartSessionImageJob(ctx, &APIPrincipal{
+		User:      user,
+		TokenType: "session",
+	}, V1ImageRequest{
+		Model:           in.Model,
+		Prompt:          in.Prompt,
+		AspectRatio:     in.Ratio,
+		Resolution:      in.Resolution,
+		ReferenceImages: in.ReferenceImages,
+		DeAI:            in.DeAI,
+	})
+}
+
 // validateReferenceMode mirrors the /v1 checks: the override must be "frame"
 // or "asset", the model must support references at all, and frame mode carries
 // at most 2 images (first+last frame).
