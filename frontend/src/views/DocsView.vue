@@ -161,7 +161,7 @@ urllib.request.urlretrieve(resp.data[0].url, "out.png")`,
   {
     title: '异步图片 · curl (提交 → 轮询)',
     code:
-`# 1) 提交任务 → {"data":{"task_id":"..."}}
+`# 1) 提交任务 → HTTP 202 {"data":{"task_id":"..."}}
 TASK_ID=$(curl -sS ${base.value}/v1/images/async/generations \\
   -H "Authorization: Bearer ${keyHint.value}" \\
   -H "Content-Type: application/json" \\
@@ -176,8 +176,8 @@ TASK_ID=$(curl -sS ${base.value}/v1/images/async/generations \\
 # 2) 未完成时 data.status 为 PENDING；失败时为 FAILED
 curl -sS ${base.value}/v1/images/async/$TASK_ID \\
   -H "Authorization: Bearer ${keyHint.value}"
-# 成功时直接返回 OpenAI 图片格式: {"created": ..., "data": [{"url": "..."}]}
-# 使用 .data[0].url 获取图片 URL
+# 成功时返回: {"status":200,"statusText":"","imageUrls":["..."],"errorPreview":null,"durationMs":0,"createdAt":"..."}
+# 使用 .imageUrls[0] 获取图片 URL
 # 兼容提交路径: POST /v1/images/generations/async`,
   },
   {
@@ -524,7 +524,7 @@ async function copy(text) {
       <h2 class="text-lg font-semibold mb-3">响应 & 计费</h2>
       <div class="card p-6 space-y-3 text-sm text-white/70">
         <p><strong class="text-white/90">同步图像</strong>(generations / edits)返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "url": "..." }] }' }}</code> —— <code class="text-white/85 font-mono">data[0].url</code> 是产物 URL,服务端不留存(<strong class="text-white/90">不返回 base64</strong>)。多数模型返回上游<strong class="text-white/90">原始直链</strong>;少数上游需鉴权的(如 gpt-image)会返回一个本站转发链 <code class="text-white/85 font-mono">/v1/images/{id}/content</code>,由服务端带账号凭据取回。<strong class="text-white/90">两种链接都会过期</strong>,请<strong class="text-white/90">尽快下载或转存到你自己的存储</strong>。</p>
-        <p><strong class="text-white/90">异步图像</strong>:<code class="text-white/85 font-mono">POST /v1/images/async/generations</code> 立即返回 <code class="text-white/85 font-mono">{{ '{ "data": { "task_id": "..." } }' }}</code>;轮询 <code class="text-white/85 font-mono">GET /v1/images/async/{task_id}</code>。未完成时响应中的 <code class="text-white/85 font-mono">data.status</code> 为 <code class="text-white/85 font-mono">PENDING</code>，失败时为 <code class="text-white/85 font-mono">FAILED</code>；成功时直接返回 OpenAI 图片格式 <code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "url": "..." }] }' }}</code>，读取 <code class="text-white/85 font-mono">data[0].url</code>。</p>
+        <p><strong class="text-white/90">异步图像</strong>:<code class="text-white/85 font-mono">POST /v1/images/async/generations</code> 立即返回 HTTP <code class="text-white/85 font-mono">202 Accepted</code> 和 <code class="text-white/85 font-mono">{{ '{ "data": { "task_id": "..." } }' }}</code>;轮询 <code class="text-white/85 font-mono">GET /v1/images/async/{task_id}</code>。未完成时响应中的 <code class="text-white/85 font-mono">data.status</code> 为 <code class="text-white/85 font-mono">PENDING</code>，失败时为 <code class="text-white/85 font-mono">FAILED</code>；成功时返回 <code class="text-white/85 font-mono">{{ '{ "status": 200, "statusText": "", "imageUrls": ["..."], "errorPreview": null, "durationMs": 0, "createdAt": "..." }' }}</code>，读取 <code class="text-white/85 font-mono">imageUrls[0]</code>。</p>
         <p><strong class="text-white/90">视频</strong>(异步,Sora 风格三步):</p>
         <ol class="list-decimal list-inside space-y-1 text-white/65 pl-1">
           <li><code class="text-white/85 font-mono">POST /v1/videos</code> 立即返回任务对象 <code class="text-white/85 font-mono">{{ '{ "id": "...", "object": "video", "status": "queued", ... }' }}</code></li>

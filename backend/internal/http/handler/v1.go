@@ -95,8 +95,8 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 }
 
 // AsyncImageGenerations — POST /v1/images/async/generations (and its
-// compatibility alias). It returns a task ID immediately; GET
-// /v1/images/async/{task_id} provides PENDING, SUCCESS, or FAILED.
+// compatibility alias). It returns 202 Accepted with a task ID immediately;
+// GET /v1/images/async/{task_id} provides PENDING, SUCCESS, or FAILED.
 func (h *V1Handler) AsyncImageGenerations(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
@@ -113,7 +113,9 @@ func (h *V1Handler) AsyncImageGenerations(c *gin.Context) {
 		h.writeV1Error(c, err, nil)
 		return
 	}
-	c.JSON(http.StatusOK, resp)
+	// The task was accepted for asynchronous processing, not completed. Match
+	// GPT Image async upstreams so callers can reliably transition to polling.
+	c.JSON(http.StatusAccepted, resp)
 }
 
 func (h *V1Handler) GetAsyncImage(c *gin.Context) {
