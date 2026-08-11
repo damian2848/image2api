@@ -29,13 +29,13 @@ if [[ ! -f /etc/image2api/updater.env ]]; then
 fi
 
 if command -v go >/dev/null 2>&1; then
-  (cd "$repo_dir/ops/updater" && go build -trimpath -ldflags='-s -w' -o /usr/local/bin/image2api-updater .)
+  (cd "$repo_dir/ops/updater" && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /usr/local/bin/image2api-updater .)
 elif command -v docker >/dev/null 2>&1; then
   docker run --rm \
     -v "$repo_dir:/src:ro" \
     -v /usr/local/bin:/out \
     golang:1.26-bookworm \
-    sh -c "cd /src/ops/updater && go build -trimpath -ldflags='-s -w' -o /out/image2api-updater ."
+    sh -c "cd /src/ops/updater && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/image2api-updater ."
 else
   echo "Go or Docker is required to build the updater binary." >&2
   exit 1
