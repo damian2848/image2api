@@ -2,23 +2,23 @@ package service
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/chatgpt"
+	"backend/internal/provider/grok"
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
 	"backend/internal/provider/leonardo"
-	"backend/internal/provider/grok"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
 
@@ -341,6 +341,11 @@ func (s *TokenService) ImportLeonardoCookie(ctx context.Context, cookie, tokenID
 	if !leonardo.IsLeonardoCookie(cookie) {
 		return nil, errors.New("not a leonardo cookie")
 	}
+	if existing, err := s.tokens.GetByPoolValue(ctx, "leonardo", cookie); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, nil
+	}
 	if tokenID == "" {
 		tokenID = newTokenID("leonardo")
 	}
@@ -403,6 +408,9 @@ func (s *TokenService) checkPendingLeonardo(tokenID, cookie string) {
 	}
 	seed := map[string]any{}
 	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
+		if s.discardPendingDuplicate(ctx, "leonardo", tokenID, em) {
+			return
+		}
 		seed["account_email"] = em
 	}
 	if dn := strings.TrimSpace(stringValue(data["display_name"])); dn != "" {
@@ -510,6 +518,9 @@ func (s *TokenService) checkPendingKrea(tokenID, cookie string) {
 		return
 	}
 	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
+		if s.discardPendingDuplicate(ctx, "krea", tokenID, em) {
+			return
+		}
 		_, _ = s.tokens.Update(ctx, "krea", tokenID, map[string]any{"account_email": em})
 	}
 	quotaMeta := map[string]any{}
@@ -605,6 +616,9 @@ func (s *TokenService) checkPendingImagine(tokenID, cred string) {
 		return
 	}
 	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
+		if s.discardPendingDuplicate(ctx, "imagine", tokenID, em) {
+			return
+		}
 		_, _ = s.tokens.Update(ctx, "imagine", tokenID, map[string]any{"account_email": em})
 	}
 	quotaMeta := map[string]any{}
@@ -619,6 +633,16 @@ func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID st
 	cookie = cleanAdobeCookie(cookie)
 	if cookie == "" {
 		return nil, nil, errors.New("cookie required")
+	}
+	if profile, err := s.refresh.GetByPoolCookie(ctx, "adobe", cookie); err != nil {
+		return nil, nil, err
+	} else if profile != nil {
+		if existing, getErr := s.tokens.Get(ctx, "adobe", profile.ID); getErr == nil {
+			return existing, profile, nil
+		}
+		// A stale refresh profile without its token can be safely reused. This keeps
+		// its cookie/profile pair aligned instead of adding a second one.
+		tokenID = profile.ID
 	}
 	if tokenID == "" {
 		tokenID = newTokenID("adobe")
@@ -700,6 +724,9 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 	// Seed the real access token, then activate so the pool can schedule it.
 	seed := map[string]any{"value": result.AccessToken}
 	email, exp := parseJWTEmailExpiry(result.AccessToken)
+	if email != "" && s.discardPendingDuplicate(ctx, "adobe", tokenID, email) {
+		return
+	}
 	if email != "" {
 		seed["account_email"] = email
 	}
@@ -759,6 +786,9 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 	if prof, e := s.adobe.FetchAccountProfile(ctx, result.AccessToken); e == nil {
 		p := map[string]any{}
 		if em := strings.TrimSpace(stringValue(prof["email"])); em != "" {
+			if s.discardPendingDuplicate(ctx, "adobe", tokenID, em) {
+				return
+			}
 			p["account_email"] = em
 		}
 		if dn := strings.TrimSpace(stringValue(prof["display_name"])); dn != "" {
@@ -907,11 +937,13 @@ func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID st
 		return nil, errors.New("not a grok sso token")
 	}
 	sid := grok.SessionIDFromToken(ssoToken)
-	// Fully async, no dedup: every import mints a fresh row (a passed-in tokenID is
-	// an explicit edit → update). We do NOT look up an existing account by
-	// email/session_id, and we leave account_email empty — email, quota and
-	// recovery time are all filled off-thread by checkPendingGrok, which also
-	// disables the account if the sso session is dead.
+	if existing, err := s.tokens.GetByPoolSessionID(ctx, "grok", sid); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, nil
+	}
+	// Grok SSO JWTs have no stable email claim, but their session id is stable
+	// enough to reject repeated imports before the asynchronous profile lookup.
 	if strings.TrimSpace(tokenID) == "" {
 		tokenID = newTokenID("grok")
 	}
@@ -934,7 +966,6 @@ func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID st
 	go s.checkPendingGrok(tokenID, ssoToken)
 	return item, nil
 }
-
 
 func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 	defer func() {
@@ -961,6 +992,9 @@ func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 			return
 		}
 	} else if strings.TrimSpace(email) != "" {
+		if s.discardPendingDuplicate(ctx, "grok", tokenID, email) {
+			return
+		}
 		_, _ = s.tokens.Update(ctx, "grok", tokenID, map[string]any{"account_email": strings.TrimSpace(email)})
 	}
 	// Console 没有额度接口，所以额度不查上游：导入即写死 图 5 / 视频 2，生成时各扣各的，
@@ -1114,6 +1148,23 @@ func (s *TokenService) finishPending(ctx context.Context, pool, id, status strin
 	_, _ = s.tokens.Update(ctx, pool, id, patch)
 }
 
+// discardPendingDuplicate removes the newly-created pending candidate when its
+// verified account identity already exists in the same provider pool. Existing
+// accounts are deliberately kept intact; this is a filter, not a destructive
+// merge of user-configured quota, weight, or status fields.
+func (s *TokenService) discardPendingDuplicate(ctx context.Context, pool, id, email string) bool {
+	existing, err := s.tokens.GetByPoolEmail(ctx, pool, email)
+	if err != nil || existing == nil || existing.ID == id {
+		return false
+	}
+	if _, err := s.tokens.Delete(ctx, pool, id); err != nil {
+		return false
+	}
+	_ = s.refresh.Delete(ctx, id)
+	log.Printf("token import: filtered duplicate %s account %s (kept %s for %s)", pool, id, existing.ID, strings.TrimSpace(email))
+	return true
+}
+
 func (s *TokenService) Update(ctx context.Context, pool, id string, body map[string]any) (*model.TokenAccount, error) {
 	pool = normalizePool(pool)
 	if pool == "" {
@@ -1143,6 +1194,12 @@ func (s *TokenService) Update(ctx context.Context, pool, id string, body map[str
 	}
 	if raw, ok := body["fails"]; ok {
 		patch["fails"] = intValue(raw)
+	}
+	if raw, ok := body["free_allowed"]; ok {
+		if pool != "adobe" {
+			return nil, errors.New("free_allowed is only supported for adobe accounts")
+		}
+		patch["free_allowed"] = boolValueWithDefault(raw, false)
 	}
 	if len(patch) == 0 {
 		return s.tokens.Get(ctx, pool, id)
@@ -1176,6 +1233,37 @@ func (s *TokenService) Delete(ctx context.Context, pool, id string) error {
 // DeleteBulk removes many accounts by id (across pools) plus their cookie
 // refresh profiles. Returns how many account rows were removed.
 func (s *TokenService) DeleteBulk(ctx context.Context, ids []string) (int, error) {
+	clean := uniqueTokenIDs(ids)
+	if len(clean) == 0 {
+		return 0, nil
+	}
+	rows, err := s.tokens.DeleteByIDs(ctx, clean)
+	if err != nil {
+		return 0, err
+	}
+	// Drop matching cookie refresh profiles (id == token id) so the background
+	// refresher doesn't re-create the tokens.
+	_ = s.refresh.DeleteByIDs(ctx, clean)
+	return int(rows), nil
+}
+
+// SetFreeAllowedBulk sets the Adobe free-account override for a multi-selection.
+// Other provider accounts and Adobe memberships are intentionally skipped: the
+// override has no meaning for them because their normal model policy differs.
+func (s *TokenService) SetFreeAllowedBulk(ctx context.Context, ids []string, allowed bool) (updated, skipped int, err error) {
+	clean := uniqueTokenIDs(ids)
+	if len(clean) == 0 {
+		return 0, 0, nil
+	}
+	rows, err := s.tokens.SetFreeAllowedByIDs(ctx, clean, allowed)
+	if err != nil {
+		return 0, 0, err
+	}
+	updated = int(rows)
+	return updated, len(clean) - updated, nil
+}
+
+func uniqueTokenIDs(ids []string) []string {
 	seen := make(map[string]struct{}, len(ids))
 	clean := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -1189,17 +1277,7 @@ func (s *TokenService) DeleteBulk(ctx context.Context, ids []string) (int, error
 		seen[id] = struct{}{}
 		clean = append(clean, id)
 	}
-	if len(clean) == 0 {
-		return 0, nil
-	}
-	rows, err := s.tokens.DeleteByIDs(ctx, clean)
-	if err != nil {
-		return 0, err
-	}
-	// Drop matching cookie refresh profiles (id == token id) so the background
-	// refresher doesn't re-create the tokens.
-	_ = s.refresh.DeleteByIDs(ctx, clean)
-	return int(rows), nil
+	return clean
 }
 
 func (s *TokenService) Accounts(ctx context.Context) ([]map[string]any, error) {
@@ -1714,6 +1792,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"dead":              item.Dead,
 		"image_limited":     item.ImageLimited,
 		"video_limited":     item.VideoLimited,
+		"free_allowed":      item.FreeAllowed,
 		"pending":           pending,
 		"sub_account":       subAccount,
 		"plan":              emptyToNil(strings.ToLower(strings.TrimSpace(stringValue(plan)))),

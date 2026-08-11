@@ -1706,8 +1706,8 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 			s.markPlanUnknownDead(ctx, "adobe", item.ID)
 			continue
 		}
-		// 普号(free)只能调度 free_allowed 的模型（香蕉2 仅 1K）
-		if !freeAccountsAllowed(modelItem, resolution) && isFreeAccount(item.Meta) {
+		// 普号默认只调度 free_allowed 的模型；账号级显式授权可作为例外。
+		if !adobeAccountCanServeModel(item, modelItem, resolution) {
 			continue
 		}
 		active = append(active, item)
@@ -1781,8 +1781,8 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 			s.markPlanUnknownDead(ctx, "adobe", item.ID)
 			continue
 		}
-		// 普号(free)只能调度 free_allowed 的模型
-		if !freeAccountsAllowed(modelItem, resolution) && isFreeAccount(item.Meta) {
+		// 普号默认只调度 free_allowed 的模型；账号级显式授权可作为例外。
+		if !adobeAccountCanServeModel(item, modelItem, resolution) {
 			continue
 		}
 		active = append(active, item)
@@ -3625,6 +3625,12 @@ func freeAccountsAllowed(modelItem *model.ModelConfig, resolution string) bool {
 		return strings.EqualFold(strings.TrimSpace(resolution), "1K")
 	}
 	return true
+}
+
+// adobeAccountCanServeModel applies the normal model-level free-account policy
+// with a deliberate account-level override set by an administrator.
+func adobeAccountCanServeModel(account model.TokenAccount, modelItem *model.ModelConfig, resolution string) bool {
+	return !isFreeAccount(account.Meta) || account.FreeAllowed || freeAccountsAllowed(modelItem, resolution)
 }
 
 func isFreeAccount(meta map[string]interface{}) bool {

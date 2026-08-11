@@ -60,6 +60,8 @@ onUnmounted(() => clearInterval(timer))
 
 // ---- KPI strip — three signals derived from real data ----
 const modelCount = computed(() => managed.value.length)
+const imageModelCount = computed(() => managed.value.filter((m) => m.type !== 'video').length)
+const videoModelCount = computed(() => managed.value.filter((m) => m.type === 'video').length)
 
 // Show the 24h average (matches the admin overview); fall back to the all-time
 // average on a quiet day so the KPI isn't blank.
@@ -124,104 +126,32 @@ function useExample(ex) {
 </script>
 
 <template>
-  <div class="space-y-28">
-    <!-- ============ HERO ============ -->
-    <section class="relative pt-8 md:pt-16 grid lg:grid-cols-[1.15fr_1fr] gap-10 lg:gap-16 items-center min-h-[640px]">
-      <!-- LEFT: copy -->
-      <div>
-        <h1 class="font-bold tracking-tight leading-[0.9] text-[clamp(2.5rem,6.5vw,6.5rem)] text-[color:var(--fg)]">
-          <span class="block text-[color:var(--fg-3)] font-light italic">Imagine</span>
-          <span class="block">it,
-            <span class="bg-gradient-to-r from-fuchsia-300 via-violet-300 to-sky-300 bg-clip-text text-transparent italic">type</span>
-            it,
-          </span>
-          <span class="block">own it.</span>
-        </h1>
-
-        <p class="mt-8 text-base md:text-lg text-[color:var(--fg-2)] max-w-md leading-relaxed">
-          {{ site.subtitle || '把脑海里的画面写成一句话,GPT、Gemini、Firefly、Flux 等顶级模型替你变成图像与视频。' }}
-        </p>
-
-        <div class="mt-10 flex items-center gap-4">
-          <button @click="go('/user')"
-                  class="group inline-flex items-center gap-3 rounded-full bg-[var(--btn-solid-bg)] text-[color:var(--btn-solid-fg)] hover:bg-[var(--btn-solid-bg-h)] pl-6 pr-3 py-3 text-sm font-semibold transition-all">
-            开始画图
-            <span class="w-8 h-8 rounded-full bg-[var(--btn-solid-fg)] text-[color:var(--btn-solid-bg)] grid place-items-center group-hover:translate-x-1 transition-transform">
-              →
-            </span>
-          </button>
-          <a href="#bento" class="text-sm text-[color:var(--fg-3)] hover:text-[color:var(--fg)] transition-colors">浏览灵感 ↓</a>
-        </div>
-
-        <!-- counter strip — three real signals: models we support, total
-             outputs ever generated, average wall-clock to produce one. -->
-        <div class="mt-14 grid grid-cols-3 gap-px rounded-2xl overflow-hidden ring-1 ring-[color:var(--hairline)] max-w-xl" style="background: var(--hairline)">
-          <div class="bg-[var(--surface)] px-5 py-4">
-            <div class="text-2xl md:text-3xl font-bold tabular-nums text-[color:var(--fg)]">{{ modelCount }}</div>
-            <div class="text-[10px] text-[color:var(--fg-3)] mt-1 uppercase tracking-[0.2em]">已接入模型</div>
+  <div class="space-y-12">
+    <section class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_20rem]">
+      <div class="card p-6 md:p-7">
+        <div class="flex flex-wrap items-start justify-between gap-5">
+          <div>
+            <div class="text-xs font-medium text-blue-600">创作工作台</div>
+            <h2 class="mt-2 text-2xl font-semibold text-[color:var(--fg)]">欢迎使用 {{ site.title }}</h2>
+            <p class="mt-2 max-w-2xl text-sm leading-6 text-[color:var(--fg-2)]">{{ site.subtitle || '统一管理图像与视频创作任务。' }}</p>
           </div>
-          <div class="bg-[var(--surface)] px-5 py-4">
-            <div class="text-2xl md:text-3xl font-bold tabular-nums text-[color:var(--fg)]">{{ stats.generated_count || 0 }}</div>
-            <div class="text-[10px] text-[color:var(--fg-3)] mt-1 uppercase tracking-[0.2em]">已生成作品</div>
-          </div>
-          <div class="bg-[var(--surface)] px-5 py-4">
-            <div class="text-2xl md:text-3xl font-bold tabular-nums text-[color:var(--fg)]">{{ avgLabel }}</div>
-            <div class="text-[10px] text-[color:var(--fg-3)] mt-1 uppercase tracking-[0.2em]">平均出片</div>
+          <div class="flex items-center gap-2">
+            <button @click="go('/user')" class="btn-primary"><Icon name="spark" class="w-4 h-4" />开始创作</button>
+            <a href="#bento" class="btn-soft">浏览灵感</a>
           </div>
         </div>
+        <div class="mt-7 grid grid-cols-2 border-t border-[color:var(--hairline)] pt-5 sm:grid-cols-4">
+          <div class="metric-cell"><span>接入模型</span><strong>{{ modelCount }}</strong></div>
+          <div class="metric-cell"><span>图像模型</span><strong>{{ imageModelCount }}</strong></div>
+          <div class="metric-cell"><span>视频模型</span><strong>{{ videoModelCount }}</strong></div>
+          <div class="metric-cell"><span>平均出片</span><strong>{{ avgLabel }}</strong></div>
+        </div>
       </div>
-
-      <!-- RIGHT: stacked card deck — driven by /admin/api/showcase (kind=hero),
-           top 3 by weight. Position classes are picked by index so existing CSS
-           transforms in <style> still apply. -->
-      <div class="relative h-[480px] lg:h-[560px] hero-deck">
-        <template v-for="(card, i) in heroDeck" :key="card.id">
-          <!-- back -->
-          <div v-if="i === 2"
-               class="deck-card deck-card-3 absolute inset-y-8 right-12 lg:right-20 w-[68%] rounded-3xl overflow-hidden ring-1 ring-white/10 shadow-2xl"
-               :style="cardBg(card)">
-            <div class="absolute inset-0 mix-blend-overlay opacity-25"
-                 style="background-image:url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22120%22 height=%22120%22><filter id=%22n%22><feTurbulence baseFrequency=%220.85%22 numOctaves=%222%22 seed=%222%22/></filter><rect width=%22100%25%22 height=%22100%25%22 filter=%22url(%23n)%22 opacity=%220.5%22/></svg>')"></div>
-            <div class="absolute inset-x-0 bottom-0 p-5 bg-gradient-to-t from-black/85 via-black/30 to-transparent">
-              <div class="text-[10px] uppercase tracking-[0.3em] text-white/55">{{ card.subtitle }}</div>
-              <div class="text-lg font-semibold text-white mt-1">{{ card.title }}</div>
-            </div>
-          </div>
-
-          <!-- middle -->
-          <div v-if="i === 1"
-               class="deck-card deck-card-2 absolute inset-y-4 right-4 lg:right-8 w-[72%] rounded-3xl overflow-hidden ring-1 ring-white/10 shadow-2xl"
-               :style="cardBg(card)">
-            <div class="absolute inset-0 mix-blend-overlay opacity-25"
-                 style="background-image:url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22120%22 height=%22120%22><filter id=%22n%22><feTurbulence baseFrequency=%220.85%22 numOctaves=%222%22 seed=%223%22/></filter><rect width=%22100%25%22 height=%22100%25%22 filter=%22url(%23n)%22 opacity=%220.5%22/></svg>')"></div>
-            <div class="absolute inset-x-0 bottom-0 p-5 bg-gradient-to-t from-black/85 via-black/30 to-transparent">
-              <div class="text-[10px] uppercase tracking-[0.3em] text-white/55">{{ card.subtitle }}</div>
-              <div class="text-lg font-semibold text-white mt-1">{{ card.title }}</div>
-            </div>
-          </div>
-
-          <!-- front -->
-          <div v-if="i === 0"
-               class="deck-card deck-card-1 absolute inset-y-0 right-0 w-[78%] rounded-3xl overflow-hidden ring-1 ring-white/15 shadow-[0_30px_80px_-20px_rgba(168,85,247,0.45)]"
-               :style="cardBg(card)">
-            <div class="absolute inset-0 mix-blend-overlay opacity-30"
-                 style="background-image:url('data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22120%22 height=%22120%22><filter id=%22n%22><feTurbulence baseFrequency=%220.85%22 numOctaves=%222%22 seed=%221%22/></filter><rect width=%22100%25%22 height=%22100%25%22 filter=%22url(%23n)%22 opacity=%220.5%22/></svg>')"></div>
-            <div class="absolute top-0 inset-x-0 flex items-center justify-between px-5 py-4">
-              <div class="flex items-center gap-1.5">
-                <span class="w-2.5 h-2.5 rounded-full bg-white/20"></span>
-                <span class="w-2.5 h-2.5 rounded-full bg-white/20"></span>
-                <span class="w-2.5 h-2.5 rounded-full bg-white/20"></span>
-              </div>
-              <div class="text-[10px] uppercase tracking-[0.25em] text-white/60 font-mono">live</div>
-            </div>
-            <div class="absolute inset-x-0 bottom-0 p-6 bg-gradient-to-t from-black/90 via-black/40 to-transparent">
-              <div class="text-[10px] uppercase tracking-[0.3em] text-white/65">{{ card.subtitle }}</div>
-              <div class="text-2xl font-bold text-white mt-2">{{ card.title }}</div>
-              <p class="text-xs text-white/70 mt-2 line-clamp-2 leading-relaxed">{{ card.prompt }}</p>
-            </div>
-          </div>
-        </template>
-      </div>
+      <aside class="card p-6">
+        <div class="flex items-center justify-between"><h2 class="text-sm font-semibold text-[color:var(--fg)]">服务状态</h2><span class="inline-flex items-center gap-1.5 text-xs text-emerald-600"><i class="status-dot"></i>运行中</span></div>
+        <dl class="mt-5 space-y-3 text-sm"><div><dt>已生成作品</dt><dd>{{ stats.generated_count || 0 }}</dd></div><div><dt>可用 Provider</dt><dd>{{ providerGroups.length }}</dd></div></dl>
+        <router-link to="/docs" class="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 hover:text-blue-700"><Icon name="book" class="w-3.5 h-3.5" />查看开发文档</router-link>
+      </aside>
     </section>
 
     <!-- ============ WORKS STRIP ============ -->
@@ -249,8 +179,8 @@ function useExample(ex) {
     <section id="bento">
       <div class="flex items-end justify-between flex-wrap gap-3 mb-8">
         <div>
-          <div class="text-[10px] uppercase tracking-[0.3em] text-violet-300/70 font-medium">灵感</div>
-          <h2 class="mt-2 text-3xl md:text-4xl font-bold tracking-tight text-[color:var(--fg)]">从一个起点开始</h2>
+          <div class="text-xs font-medium text-blue-600">灵感库</div>
+          <h2 class="mt-2 text-xl font-semibold text-[color:var(--fg)]">从一个起点开始</h2>
           <p class="text-[color:var(--fg-3)] mt-2 max-w-md">点任意一张,自动进入画图工作台并预填提示词。</p>
         </div>
       </div>
@@ -283,17 +213,15 @@ function useExample(ex) {
     <section>
       <div class="flex items-end justify-between flex-wrap gap-3 mb-8">
         <div>
-          <div class="text-[10px] uppercase tracking-[0.3em] text-sky-300/70 font-medium">模型</div>
-          <h2 class="mt-2 text-3xl md:text-4xl font-bold tracking-tight text-[color:var(--fg)]">已接入</h2>
+          <div class="text-xs font-medium text-blue-600">模型服务</div>
+          <h2 class="mt-2 text-xl font-semibold text-[color:var(--fg)]">已接入模型</h2>
           <p class="text-[color:var(--fg-3)] mt-2 max-w-md">由管理员在后台注册;以下为已对接的上游 family。</p>
         </div>
       </div>
 
       <div class="grid sm:grid-cols-2 md:grid-cols-3 gap-3">
         <div v-for="p in providerGroups" :key="p.name"
-             class="group relative overflow-hidden rounded-2xl bg-[var(--surface)] ring-1 ring-[color:var(--hairline)] p-5 hover:ring-[color:var(--fg-faint)] transition-all">
-          <div class="absolute -right-8 -top-8 w-32 h-32 rounded-full bg-gradient-to-br opacity-30 blur-xl group-hover:opacity-50 transition-opacity"
-               :class="p.grad"></div>
+             class="group relative overflow-hidden rounded-lg bg-[var(--surface)] ring-1 ring-[color:var(--hairline)] p-5 hover:ring-blue-200 transition-all">
           <div class="relative flex items-center justify-between">
             <div>
               <div class="text-base font-semibold capitalize text-[color:var(--fg)]">{{ p.name }}</div>
@@ -302,7 +230,7 @@ function useExample(ex) {
                 <span v-if="p.video">{{ p.video }} 视频</span>
               </div>
             </div>
-            <span class="w-2.5 h-2.5 rounded-full bg-gradient-to-br" :class="p.grad"></span>
+            <span class="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
           </div>
         </div>
         <div v-if="!providerGroups.length" class="text-sm text-[color:var(--fg-3)] col-span-full text-center py-10">
@@ -345,43 +273,7 @@ function useExample(ex) {
 
 <style scoped>
 .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-
-/* ----- Hero stacked card deck ----- */
-.hero-deck { perspective: 1200px; }
-.deck-card { transform-origin: center bottom; will-change: transform, opacity; }
-/* staggered fade-in-up on load, then a livelier continuous float with a gentle
-   rotation wobble. The :hover rules below still take over to fan the deck out. */
-.deck-card-1 { animation: deckIn1 0.8s cubic-bezier(0.2,0.7,0.2,1) backwards, deckFloat1 7s ease-in-out 0.8s infinite; }
-.deck-card-2 { animation: deckIn2 0.8s cubic-bezier(0.2,0.7,0.2,1) 0.12s backwards, deckFloat2 9s ease-in-out 0.92s infinite; }
-.deck-card-3 { animation: deckIn3 0.8s cubic-bezier(0.2,0.7,0.2,1) 0.24s backwards, deckFloat3 11s ease-in-out 1.04s infinite; opacity: 0.85; }
-@keyframes deckFloat1 {
-  0%,100% { transform: rotate(2deg) translateY(0); }
-  35%     { transform: rotate(0.5deg) translateY(-16px); }
-  70%     { transform: rotate(3deg) translateY(-7px); }
-}
-@keyframes deckFloat2 {
-  0%,100% { transform: rotate(-3deg) translateY(0); }
-  50%     { transform: rotate(-1.5deg) translateY(-13px); }
-}
-@keyframes deckFloat3 {
-  0%,100% { transform: rotate(5deg) translateY(0); }
-  50%     { transform: rotate(3.5deg) translateY(-10px); }
-}
-@keyframes deckIn1 {
-  from { opacity: 0; transform: rotate(2deg) translateY(48px) scale(0.92); }
-  to   { opacity: 1; transform: rotate(2deg) translateY(0) scale(1); }
-}
-@keyframes deckIn2 {
-  from { opacity: 0; transform: rotate(-3deg) translateY(48px) scale(0.92); }
-  to   { opacity: 1; transform: rotate(-3deg) translateY(0) scale(1); }
-}
-@keyframes deckIn3 {
-  from { opacity: 0; transform: rotate(5deg) translateY(48px) scale(0.92); }
-  to   { opacity: 0.85; transform: rotate(5deg) translateY(0) scale(1); }
-}
-.hero-deck:hover .deck-card-1 { transform: rotate(0deg) translateY(-12px); transition: transform 0.4s ease; animation: none; }
-.hero-deck:hover .deck-card-2 { transform: rotate(-6deg) translate(-30px, 10px); transition: transform 0.4s ease; animation: none; }
-.hero-deck:hover .deck-card-3 { transform: rotate(8deg) translate(-50px, 20px); transition: transform 0.4s ease; animation: none; opacity: 0.7; }
+.metric-cell { padding: 0.25rem 1rem; border-right: 1px solid var(--hairline); }.metric-cell:first-child { padding-left: 0; }.metric-cell:last-child { border-right: 0; }.metric-cell span { display: block; color: var(--fg-3); font-size: 0.75rem; }.metric-cell strong { display: block; margin-top: 0.35rem; color: var(--fg); font-size: 1.5rem; font-weight: 650; line-height: 1; }.status-dot { width: 0.45rem; height: 0.45rem; border-radius: 999px; background: currentColor; }dl div { display: flex; align-items: center; justify-content: space-between; }dt { color: var(--fg-3); }dd { color: var(--fg); font-weight: 600; }@media (max-width: 639px) { .metric-cell:nth-child(2) { border-right: 0; }.metric-cell:nth-child(n + 3) { margin-top: 1rem; }.metric-cell:nth-child(3) { padding-left: 0; } }
 
 .marquee-wrap {
   position: relative;

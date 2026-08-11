@@ -18,6 +18,8 @@ const fixedConcurrency =
 
 const weight = ref(Number(props.account.weight) || 0)
 const concurrency = ref(Number(props.account.concurrency) || 1)
+const canOverrideFreePolicy = props.account.type === 'adobe' && props.account.plan === 'free'
+const freeAllowed = ref(Boolean(props.account.free_allowed))
 const status = ref('')
 const isError = ref(false)
 const submitting = ref(false)
@@ -26,6 +28,7 @@ async function submit() {
   submitting.value = true; status.value = ''; isError.value = false
   const payload = { weight: Number(weight.value) || 0 }
   if (canEditConcurrency) payload.concurrency = Math.max(1, Number(concurrency.value) || 1)
+  if (canOverrideFreePolicy) payload.free_allowed = freeAllowed.value
   try {
     const r = await api(`/tokens/${props.account.pool}/${props.account.id}`, jsonBody('PATCH', payload))
     if (r.ok) {
@@ -70,6 +73,10 @@ async function submit() {
           <input v-if="canEditConcurrency" v-model.number="concurrency" type="number" min="1" class="field" placeholder="1" />
           <input v-else :value="fixedConcurrency" disabled class="field" />
         </div>
+        <label v-if="canOverrideFreePolicy" class="flex items-center gap-2.5 cursor-pointer select-none py-1">
+          <input v-model="freeAllowed" type="checkbox" class="chk" />
+          <span class="text-sm text-white/85">允许调用受限模型</span>
+        </label>
         <p v-if="status" class="text-xs" :class="isError ? 'text-rose-400' : 'text-emerald-400'">{{ status }}</p>
         <div class="flex justify-end gap-2 pt-2">
           <button @click="emit('close')" class="btn-soft">取消</button>

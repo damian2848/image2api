@@ -1,0 +1,11 @@
+# Public HTTP override for the current Tencent Lighthouse instance.
+# Keep the base compose file on :2000 for local development and put TLS/domain
+# routing in a separate reverse proxy when additional sites are deployed.
+services:
+  backend:
+    environment:
+      CORS_ORIGINS: http://43.128.10.245,http://43.128.10.245:2000
+
+  web:
+    ports:
+      - "80:2000"

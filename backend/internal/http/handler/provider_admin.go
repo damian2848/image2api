@@ -326,6 +326,33 @@ func (h *ProviderAdminHandler) TokenDeleteBulk(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "deleted": n})
 }
 
+// TokenFreeAllowedBulk applies the Adobe free-account restricted-model override
+// to a multi-selection. The service filters unsupported account types itself.
+func (h *ProviderAdminHandler) TokenFreeAllowedBulk(c *gin.Context) {
+	var body struct {
+		IDs         []string `json:"ids"`
+		FreeAllowed *bool    `json:"free_allowed"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+		return
+	}
+	if len(body.IDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "未选择任何账号"})
+		return
+	}
+	if body.FreeAllowed == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "free_allowed is required"})
+		return
+	}
+	updated, skipped, err := h.tokens.SetFreeAllowedBulk(c.Request.Context(), body.IDs, *body.FreeAllowed)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "updated": updated, "skipped": skipped})
+}
+
 func (h *ProviderAdminHandler) AccountsList(c *gin.Context) {
 	data, err := h.tokens.Accounts(c.Request.Context())
 	if err != nil {
@@ -363,13 +390,21 @@ func (h *ProviderAdminHandler) AccountsList(c *gin.Context) {
 			isFree := plan == "" || plan == "free"
 			switch planFilter {
 			case "vip":
-				if isFree { continue }
+				if isFree {
+					continue
+				}
 			case "free":
-				if !isFree { continue }
+				if !isFree {
+					continue
+				}
 			case "sub":
-				if !isSub { continue }
+				if !isSub {
+					continue
+				}
 			case "master":
-				if isFree || isSub { continue }
+				if isFree || isSub {
+					continue
+				}
 			}
 		}
 		if q != "" {

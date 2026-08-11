@@ -2,6 +2,8 @@ package repo
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"time"
 
 	"backend/internal/model"
@@ -29,6 +31,27 @@ func (r *RefreshProfileRepository) List(ctx context.Context) ([]model.RefreshPro
 func (r *RefreshProfileRepository) Get(ctx context.Context, id string) (*model.RefreshProfile, error) {
 	var item model.RefreshProfile
 	if err := r.db.WithContext(ctx).First(&item, "id = ?", id).Error; err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+// GetByPoolCookie finds an existing refresh profile for the exact cookie. Adobe
+// account tokens are minted asynchronously, so this blocks repeated cookies
+// before a second pending token row can be created.
+func (r *RefreshProfileRepository) GetByPoolCookie(ctx context.Context, pool, cookie string) (*model.RefreshProfile, error) {
+	cookie = strings.TrimSpace(cookie)
+	if cookie == "" {
+		return nil, nil
+	}
+	var item model.RefreshProfile
+	err := r.db.WithContext(ctx).
+		Where("pool = ? AND cookie = ?", pool, cookie).
+		First(&item).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
 		return nil, err
 	}
 	return &item, nil

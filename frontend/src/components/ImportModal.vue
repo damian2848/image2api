@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { api, jsonBody } from '../api'
-import { parseImportInput } from '../utils/import'
+import { dedupeImportItems, parseImportInput } from '../utils/import'
 import Icon from './Icon.vue'
 
 const emit = defineEmits(['close', 'imported'])
@@ -18,7 +18,8 @@ const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', runway: 'runway', leonard
 // Live preview of what the parser would extract — updates as the user types
 // so they can see whether their paste was understood before clicking import.
 const detected = computed(() => {
-  const items = parseImportInput(input.value)
+  const parsed = parseImportInput(input.value)
+  const { items, skipped } = dedupeImportItems(parsed)
   const openai = items.filter((x) => x.type === 'openai').length
   const adobe = items.filter((x) => x.type === 'adobe').length
   const runway = items.filter((x) => x.type === 'runway').length
@@ -26,7 +27,7 @@ const detected = computed(() => {
   const krea = items.filter((x) => x.type === 'krea').length
   const imagine = items.filter((x) => x.type === 'imagine').length
   const grok = items.filter((x) => x.type === 'grok').length
-  return { total: items.length, openai, adobe, runway, leonardo, krea, imagine, grok }
+  return { sourceTotal: parsed.length, total: items.length, skipped, openai, adobe, runway, leonardo, krea, imagine, grok }
 })
 
 function setStatus(text, err = false) {
@@ -35,13 +36,14 @@ function setStatus(text, err = false) {
 }
 
 async function doSmartImport() {
-  const items = parseImportInput(input.value)
+  const { items, skipped: batchDuplicates } = dedupeImportItems(parseImportInput(input.value))
   if (!items.length) {
-    setStatus('未识别到任何 Cookie 或 JWT', true)
+    if (batchDuplicates) setStatus(`已过滤 ${batchDuplicates} 个重复账号，无需导入`)
+    else setStatus('未识别到任何 Cookie 或 JWT', true)
     return
   }
   submitting.value = true
-  let ok = 0, fail = 0
+  let ok = 0, fail = 0, duplicates = batchDuplicates
   const errs = []
   for (let i = 0; i < items.length; i++) {
     const it = items[i]
@@ -76,12 +78,17 @@ async function doSmartImport() {
   // Quota isn't checked here — the server probes each token off-thread and the
   // account list flips pending → active/dead on its own.
   if (fail === 0) {
+    if (duplicates) {
+      setStatus(`已导入 ${ok} 个账号，已过滤 ${duplicates} 个重复账号`)
+      emit('imported')
+      return
+    }
     // Close immediately on success — the account lands in the table right away
     // and the server backfills quota/email off-thread (pending → active/dead).
     emit('imported')
     emit('close')
   } else {
-    setStatus(`成功 ${ok} · 失败 ${fail} · ${errs.slice(0, 3).join(' | ')}`, true)
+    setStatus(`成功 ${ok} · 重复 ${duplicates} · 失败 ${fail} · ${errs.slice(0, 3).join(' | ')}`, true)
     emit('imported')
   }
 }
@@ -118,9 +125,10 @@ async function doSmartImport() {
         <textarea v-model="input" rows="10"
                   class="field font-mono text-xs resize-none"
                   placeholder="直接粘 Cookie 字符串 / JWT / JSON，自动识别"></textarea>
-        <div v-if="input.trim()" class="mt-2 flex items-center gap-2 text-xs">
-          <template v-if="detected.total">
-            <span class="text-emerald-600">✓ 识别到 <strong class="tabular-nums">{{ detected.total }}</strong> 个账号</span>
+        <div v-if="input.trim()" class="mt-2 flex flex-wrap items-center gap-2 text-xs">
+          <template v-if="detected.sourceTotal">
+            <span class="text-emerald-600">✓ 识别到 <strong class="tabular-nums">{{ detected.sourceTotal }}</strong> 个账号，待导入 <strong class="tabular-nums">{{ detected.total }}</strong> 个</span>
+            <span v-if="detected.skipped" class="text-amber-600">已过滤重复 · <strong class="tabular-nums">{{ detected.skipped }}</strong></span>
             <span v-if="detected.openai" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-emerald-700 bg-emerald-50 ring-1 ring-emerald-200">
               OpenAI · <span class="tabular-nums">{{ detected.openai }}</span>
             </span>

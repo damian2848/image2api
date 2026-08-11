@@ -31,6 +31,7 @@ function applyEdit(payload) {
   if (!row) return
   if (payload.weight != null) row.weight = payload.weight
   if (payload.concurrency != null) row.concurrency = payload.concurrency
+  if (payload.free_allowed != null) row.free_allowed = payload.free_allowed
 }
 
 const typeFilter = ref('')      // '' | 'openai' | 'adobe' | 'runway' | 'leonardo'
@@ -299,7 +300,7 @@ async function deleteDeadAccounts() {
   loadAccounts()
 }
 
-// ===== 多选删除 =====
+// ===== 多选操作 =====
 const selected = ref(new Set())
 function toggleSelect(id) {
   const s = new Set(selected.value)
@@ -324,6 +325,22 @@ async function deleteSelected() {
     selected.value = new Set()
     loadAccounts()
   }
+}
+async function setSelectedFreeAllowed(allowed) {
+  const ids = [...selected.value]
+  if (!ids.length) return
+  const label = allowed ? '允许调用受限模型' : '禁止调用受限模型'
+  if (!confirm(`确认对选中的 ${ids.length} 个账号${label}?仅 Adobe 普号会被修改。`)) return
+  const r = await api('/tokens/free-allowed-bulk', jsonBody('POST', { ids, free_allowed: allowed }))
+  if (!r.ok) {
+    alert(r.data?.detail || '批量修改失败')
+    return
+  }
+  selected.value = new Set()
+  await loadAccounts()
+  const updated = Number(r.data?.updated) || 0
+  const skipped = Number(r.data?.skipped) || 0
+  alert(`${label}：已更新 ${updated} 个账号${skipped ? `，跳过 ${skipped} 个非 Adobe 普号` : ''}`)
 }
 
 onMounted(() => { loadAccounts(); loadModelList() })
@@ -399,6 +416,12 @@ onMounted(() => { loadAccounts(); loadModelList() })
       <div class="flex-1 min-w-[200px]">
         <input v-model="search" class="field !py-1.5 text-xs" placeholder="搜索 邮箱 / ID / 类型…" />
       </div>
+      <button v-if="selected.size" @click="setSelectedFreeAllowed(true)" class="btn-soft" title="仅对选中的 Adobe 普号生效">
+        <Icon name="shield" class="w-3.5 h-3.5" /> 允许受限 ({{ selected.size }})
+      </button>
+      <button v-if="selected.size" @click="setSelectedFreeAllowed(false)" class="btn-soft" title="仅对选中的 Adobe 普号生效">
+        <Icon name="ban" class="w-3.5 h-3.5" /> 禁止受限
+      </button>
       <button v-if="selected.size" @click="deleteSelected" class="btn-soft danger" title="删除选中的账号">
         <Icon name="trash" class="w-3.5 h-3.5" /> 删除选中 ({{ selected.size }})
       </button>
