@@ -1,0 +1,17 @@
+[Unit]
+Description=image2api online update agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/image2api/updater.env
+ExecStart=/usr/local/bin/image2api-updater -repo ${IMAGE2API_REPO} -github-repo ${IMAGE2API_GITHUB_REPO} -compose-files ${IMAGE2API_COMPOSE_FILES}
+Restart=always
+RestartSec=3
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

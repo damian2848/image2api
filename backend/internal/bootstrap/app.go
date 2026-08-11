@@ -115,6 +115,7 @@ func NewApp(ctx context.Context) (*App, error) {
 	rustfsClient := storage.New(cfg.RustFSEndpoint, cfg.RustFSBucket, cfg.RustFSAccessKey, cfg.RustFSSecretKey)
 	authSvc := service.NewAuthService(userRepo, siteRepo, sessionSvc, emailCodeSvc, smtpSvc, cgroupRepo)
 	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, rustfsClient)
+	updateSvc := service.NewSystemUpdateService(cfg.UpdaterURL, cfg.UpdaterToken)
 	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
 	adobeClient := adobe.NewClient("projectx_webapp", "")
 	chatGPTClient := chatgpt.NewClient("")
@@ -164,6 +165,7 @@ func NewApp(ctx context.Context) (*App, error) {
 		Announcement:  handler.NewAnnouncementHandler(announcementSvc),
 		Payment:       handler.NewPaymentHandler(paymentSvc),
 		BannedWords:   handler.NewBannedWordsHandler(bannedWordRepo),
+		SystemUpdate:  handler.NewSystemUpdateHandler(updateSvc),
 	})
 
 	// Background self-healing sweep (quota recovery, cookie refresh, stale-pending

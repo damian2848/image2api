@@ -29,6 +29,7 @@ type Handlers struct {
 	Announcement  *handler.AnnouncementHandler
 	Payment       *handler.PaymentHandler
 	BannedWords   *handler.BannedWordsHandler
+	SystemUpdate  *handler.SystemUpdateHandler
 }
 
 func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.Engine {
@@ -110,6 +111,8 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 	authed.Use(middleware.RequireAdminSession(auth, cfg))
 	{
 		authed.GET("/dashboard", handlers.AdminRead.Dashboard)
+		authed.GET("/system/update", handlers.SystemUpdate.Status)
+		authed.POST("/system/update", handlers.SystemUpdate.Start)
 		authed.GET("/users", handlers.AdminRead.Users)
 		authed.GET("/invites", handlers.AdminRead.Invites)
 		authed.POST("/users", handlers.AdminWrite.CreateUser)

@@ -34,6 +34,7 @@ const InvitesAdminView = () => import('./views/InvitesAdminView.vue')
 const ImagesView = () => import('./views/ImagesView.vue')
 const LogsView = () => import('./views/LogsView.vue')
 const ConfigView = () => import('./views/ConfigView.vue')
+const SystemUpdateView = () => import('./views/SystemUpdateView.vue')
 const ShowcaseView = () => import('./views/ShowcaseView.vue')
 
 const routes = [
@@ -71,6 +72,7 @@ const routes = [
       { path: 'showcase', component: ShowcaseView, meta: { label: '首页内容' } },
       { path: 'logs',     component: LogsView,     meta: { label: '日志管理' } },
       { path: 'config',   component: ConfigView,   meta: { label: '系统配置' } },
+      { path: 'update',   component: SystemUpdateView, meta: { label: '在线更新' } },
     ],
   },
   // legacy redirects
