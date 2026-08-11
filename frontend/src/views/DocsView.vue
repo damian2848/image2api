@@ -68,6 +68,7 @@ const imageParams = [
   ['prompt', 'string', '必填', '文字描述'],
   ['image_size', 'string', '可选', '分辨率档:"1K" / "2K" / "4K"。与 aspect_ratio 配合使用;留空 = 2K'],
   ['aspect_ratio', 'string', '可选', '比例,如 "16:9"。与 image_size 配合使用;留空 = 1:1'],
+  ['image', 'string[]', '可选', '公网参考图 URL 数组;支持一张或多张,服务端会安全下载后转发给模型'],
   ['size', 'string', '可选', '兼容旧格式:宽x高,如 "2048x1152"。若同时传 image_size / aspect_ratio,对应显式字段优先'],
 ]
 const editParams = [
@@ -133,7 +134,8 @@ const examples = computed(() => [
     "model": "${sampleImage.value}",
     "prompt": "a corgi running in a golden wheat field, cinematic",
     "image_size": "2K",
-    "aspect_ratio": "16:9"
+    "aspect_ratio": "16:9",
+    "image": ["https://example.com/reference-corgi.png"]
   }'`,
   },
   {
@@ -147,10 +149,35 @@ client = OpenAI(api_key="${keyHint.value}", base_url="${base.value}/v1")
 resp = client.images.generate(
     model="${sampleImage.value}",
     prompt="a corgi running in a golden wheat field, cinematic",
-    extra_body={"image_size": "2K", "aspect_ratio": "16:9"},
+    extra_body={
+        "image_size": "2K",
+        "aspect_ratio": "16:9",
+        "image": ["https://example.com/reference-corgi.png"],
+    },
 )
 # 结果是图片 URL(上游原始直链,会过期 → 尽快下载/转存)
 urllib.request.urlretrieve(resp.data[0].url, "out.png")`,
+  },
+  {
+    title: '异步图片 · curl (提交 → 轮询)',
+    code:
+`# 1) 提交任务 → {"data":{"task_id":"..."}}
+TASK_ID=$(curl -sS ${base.value}/v1/images/async/generations \\
+  -H "Authorization: Bearer ${keyHint.value}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${sampleImage.value}",
+    "prompt": "cinematic 16:9 wheat field at golden hour",
+    "image_size": "2K",
+    "aspect_ratio": "16:9",
+    "image": ["https://example.com/reference-field.png"]
+  }' | jq -r '.data.task_id')
+
+# 2) 轮询 data.status: PENDING / SUCCESS / FAILED
+curl -sS ${base.value}/v1/images/async/$TASK_ID \\
+  -H "Authorization: Bearer ${keyHint.value}"
+# SUCCESS 时读取 .data.result_url
+# 兼容提交路径: POST /v1/images/generations/async`,
   },
   {
     title: '图生图 / 参考图 · curl (multipart)',
@@ -287,6 +314,8 @@ async function copy(text) {
           <li class="flex items-center gap-2"><span class="badge-get">GET</span><span class="text-white/80">/v1/models</span></li>
           <li class="flex items-center gap-2"><span class="badge-get">GET</span><span class="text-white/80">/v1/user/balance</span><span class="text-white/35 font-sans text-xs">查余额</span></li>
           <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/images/generations</span><span class="text-white/35 font-sans text-xs">文生图</span></li>
+          <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80 break-all">/v1/images/async/generations</span><span class="text-white/35 font-sans text-xs">异步图片</span></li>
+          <li class="flex items-center gap-2"><span class="badge-get">GET</span><span class="text-white/80 break-all">/v1/images/async/{task_id}</span><span class="text-white/35 font-sans text-xs">查图片任务</span></li>
           <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/images/edits</span><span class="text-white/35 font-sans text-xs">图生图(multipart)</span></li>
           <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/videos</span><span class="text-white/35 font-sans text-xs">建视频任务</span></li>
           <li class="flex items-center gap-2"><span class="badge-get">GET</span><span class="text-white/80">/v1/videos/{id}</span><span class="text-white/35 font-sans text-xs">查状态</span></li>
@@ -493,7 +522,8 @@ async function copy(text) {
     <section>
       <h2 class="text-lg font-semibold mb-3">响应 & 计费</h2>
       <div class="card p-6 space-y-3 text-sm text-white/70">
-        <p><strong class="text-white/90">图像</strong>(generations / edits)返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "url": "..." }] }' }}</code> —— <code class="text-white/85 font-mono">data[0].url</code> 是产物 URL,服务端不留存(<strong class="text-white/90">不返回 base64</strong>)。多数模型返回上游<strong class="text-white/90">原始直链</strong>;少数上游需鉴权的(如 gpt-image)会返回一个本站转发链 <code class="text-white/85 font-mono">/v1/images/{id}/content</code>,由服务端带账号凭据取回。<strong class="text-white/90">两种链接都会过期</strong>,请<strong class="text-white/90">尽快下载或转存到你自己的存储</strong>。</p>
+        <p><strong class="text-white/90">同步图像</strong>(generations / edits)返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "url": "..." }] }' }}</code> —— <code class="text-white/85 font-mono">data[0].url</code> 是产物 URL,服务端不留存(<strong class="text-white/90">不返回 base64</strong>)。多数模型返回上游<strong class="text-white/90">原始直链</strong>;少数上游需鉴权的(如 gpt-image)会返回一个本站转发链 <code class="text-white/85 font-mono">/v1/images/{id}/content</code>,由服务端带账号凭据取回。<strong class="text-white/90">两种链接都会过期</strong>,请<strong class="text-white/90">尽快下载或转存到你自己的存储</strong>。</p>
+        <p><strong class="text-white/90">异步图像</strong>:<code class="text-white/85 font-mono">POST /v1/images/async/generations</code> 立即返回 <code class="text-white/85 font-mono">{{ '{ "data": { "task_id": "..." } }' }}</code>;轮询 <code class="text-white/85 font-mono">GET /v1/images/async/{task_id}</code>。响应中的 <code class="text-white/85 font-mono">data.status</code> 为 <code class="text-white/85 font-mono">PENDING</code>、<code class="text-white/85 font-mono">SUCCESS</code> 或 <code class="text-white/85 font-mono">FAILED</code>,成功时读取 <code class="text-white/85 font-mono">data.result_url</code>。</p>
         <p><strong class="text-white/90">视频</strong>(异步,Sora 风格三步):</p>
         <ol class="list-decimal list-inside space-y-1 text-white/65 pl-1">
           <li><code class="text-white/85 font-mono">POST /v1/videos</code> 立即返回任务对象 <code class="text-white/85 font-mono">{{ '{ "id": "...", "object": "video", "status": "queued", ... }' }}</code></li>

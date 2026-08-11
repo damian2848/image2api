@@ -18,6 +18,21 @@ type V1Handler struct {
 	v1 *service.V1Service
 }
 
+type imageGenerationBody struct {
+	Model          string   `json:"model"`
+	Prompt         string   `json:"prompt"`
+	N              int      `json:"n"`
+	Size           string   `json:"size"`
+	ImageSize      string   `json:"image_size"`
+	AspectRatio    string   `json:"aspect_ratio"`
+	Quality        string   `json:"quality"`
+	Image          []string `json:"image"`
+	ResponseFormat string   `json:"response_format"`
+	Background     string   `json:"background"`
+	OutputFormat   string   `json:"output_format"`
+	User           string   `json:"user"`
+}
+
 func NewV1Handler(v1 *service.V1Service) *V1Handler {
 	return &V1Handler{v1: v1}
 }
@@ -57,49 +72,84 @@ func (h *V1Handler) UserBalance(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// ImageGenerations — OpenAI POST /v1/images/generations (text-to-image only).
-// Supports either a legacy size (WxH) or image_size + aspect_ratio. Explicit
-// image_size / aspect_ratio values take precedence over values inferred from size.
-// Returns {created, data:[{b64_json}]}.
+// ImageGenerations — POST /v1/images/generations. Supports GPT Image 2's
+// image_size, aspect_ratio, and public image URL references, while retaining
+// legacy size (WxH) compatibility.
 func (h *V1Handler) ImageGenerations(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
 		h.writeAuthError(c, err)
 		return
 	}
-
-	var body struct {
-		Model          string `json:"model"`
-		Prompt         string `json:"prompt"`
-		N              int    `json:"n"`
-		Size           string `json:"size"`
-		ImageSize      string `json:"image_size"`
-		AspectRatio    string `json:"aspect_ratio"`
-		Quality        string `json:"quality"`
-		ResponseFormat string `json:"response_format"`
-		Background     string `json:"background"`
-		OutputFormat   string `json:"output_format"`
-		User           string `json:"user"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+	in, err := h.imageGenerationRequest(c)
+	if err != nil {
+		h.writeV1Error(c, err, nil)
 		return
 	}
-
-	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, service.V1ImageRequest{
-		Model:       body.Model,
-		Prompt:      body.Prompt,
-		N:           body.N,
-		Size:        body.Size,
-		Resolution:  body.ImageSize,
-		AspectRatio: body.AspectRatio,
-		BaseURL:     requestBaseURL(c),
-	})
+	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, in)
 	if err != nil {
 		h.writeV1Error(c, err, resp)
 		return
 	}
 	c.JSON(http.StatusOK, openaiImageResponse(resp))
+}
+
+// AsyncImageGenerations — POST /v1/images/async/generations (and its
+// compatibility alias). It returns a task ID immediately; GET
+// /v1/images/async/{task_id} provides PENDING, SUCCESS, or FAILED.
+func (h *V1Handler) AsyncImageGenerations(c *gin.Context) {
+	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
+	if err != nil {
+		h.writeAuthError(c, err)
+		return
+	}
+	in, err := h.imageGenerationRequest(c)
+	if err != nil {
+		h.writeV1Error(c, err, nil)
+		return
+	}
+	resp, err := h.v1.StartAsyncImageRequest(c.Request.Context(), principal, in)
+	if err != nil {
+		h.writeV1Error(c, err, nil)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *V1Handler) GetAsyncImage(c *gin.Context) {
+	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
+	if err != nil {
+		h.writeAuthError(c, err)
+		return
+	}
+	resp, err := h.v1.AsyncImageJob(c.Request.Context(), principal, c.Param("task_id"), requestBaseURL(c))
+	if err != nil {
+		h.writeV1Error(c, err, nil)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func (h *V1Handler) imageGenerationRequest(c *gin.Context) (service.V1ImageRequest, error) {
+	var body imageGenerationBody
+	if err := c.ShouldBindJSON(&body); err != nil {
+		return service.V1ImageRequest{}, errors.New("invalid request body")
+	}
+	references, err := h.v1.ResolveImageReferences(c.Request.Context(), body.Image)
+	if err != nil {
+		return service.V1ImageRequest{}, err
+	}
+	return service.V1ImageRequest{
+		Model:           body.Model,
+		Prompt:          body.Prompt,
+		N:               body.N,
+		Size:            body.Size,
+		Quality:         body.Quality,
+		Resolution:      body.ImageSize,
+		AspectRatio:     body.AspectRatio,
+		ReferenceImages: references,
+		BaseURL:         requestBaseURL(c),
+	}, nil
 }
 
 // ImageEdits — OpenAI POST /v1/images/edits (image-to-image). multipart/form-data
@@ -389,9 +439,9 @@ func (h *V1Handler) writeV1Error(c *gin.Context, err error, payload map[string]a
 		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": err.Error()})
 	case errors.Is(err, service.ErrConcurrencyFull), errors.Is(err, service.ErrUserConcurrencyFull):
 		c.JSON(http.StatusTooManyRequests, gin.H{"detail": err.Error()})
-	case errors.Is(err, service.ErrVideoJobNotFound):
+	case errors.Is(err, service.ErrVideoJobNotFound), errors.Is(err, service.ErrImageJobNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
-	case errors.Is(err, service.ErrVideoNotReady):
+	case errors.Is(err, service.ErrVideoNotReady), errors.Is(err, service.ErrImageNotReady):
 		c.JSON(http.StatusConflict, gin.H{"detail": err.Error()})
 	case errors.Is(err, service.ErrProviderUnsupported):
 		c.JSON(http.StatusNotImplemented, gin.H{"detail": err.Error()})

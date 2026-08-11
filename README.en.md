@@ -90,9 +90,9 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 - **De-AI fingerprint** (optional): one-click toggle on the playground — generated images get anti-AI-detection post-processing (subtle detail jitter + metadata stripping), charged as a per-tier surcharge (defaults 1K+1 / 2K+2 / 4K+3 credits, admin-configurable, can be disabled globally); processed works carry a "de-AI" badge across the playground, gallery, logs and admin image manager
 
 #### 🔌 OpenAI Compatible
-- Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`) · `/v1/models` · balance `/v1/user/balance` (remaining / cumulative used)
-- **Strict OpenAI params**: `size` drives **both aspect ratio + resolution tier** (images by long edge → 1K/2K/4K, videos by short edge → 720p/1080p) — just swap `base_url` + `api_key` into an existing OpenAI SDK
-- Image results returned **inline as base64** — nothing stored server-side, privacy-friendly; the in-app **/docs** ships a size ↔ tier reference table
+- Text-to-image `/v1/images/generations` · async images `/v1/images/async/generations` → poll `/v1/images/async/{task_id}` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`) · `/v1/models` · balance `/v1/user/balance` (remaining / cumulative used)
+- Images support `image_size` (1K/2K/4K), `aspect_ratio`, and an `image` array of public reference URLs; legacy `size` (WxH) remains supported. Video `size` maps by short edge to 720p/1080p
+- Image results return URLs; the in-app **/docs** includes complete sync, async, and resolution examples
 
 #### 🔁 Account Pools + Smart Failover
 - Round-robin scheduling across the pool; one bad account doesn't break the whole
@@ -143,7 +143,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 ## 🔌 OpenAI-Compatible API
 
 ```bash
-# Text-to-image — prefer image_size + aspect_ratio; legacy size (WxH) remains supported
+# Synchronous image — prefer image_size + aspect_ratio; image accepts public reference URL arrays
 curl https://your-domain/v1/images/generations \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Content-Type: application/json" \
@@ -151,8 +151,17 @@ curl https://your-domain/v1/images/generations \
     "model": "gpt-image-2",
     "prompt": "a cute cat on a desk, studio lighting",
     "image_size": "2K",
-    "aspect_ratio": "16:9"
+    "aspect_ratio": "16:9",
+    "image": ["https://example.com/reference-cat.png"]
   }'
+
+# Async image — returns {"data":{"task_id":"..."}}; read data.result_url after SUCCESS
+curl https://your-domain/v1/images/async/generations \
+  -H "Authorization: Bearer sk-xxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-image-2","prompt":"a cinematic wheat field","image_size":"2K","aspect_ratio":"16:9"}'
+# Compatibility path: POST /v1/images/generations/async
+# GET /v1/images/async/{task_id} → data.status: PENDING / SUCCESS / FAILED
 
 # Image-to-image — multipart reference upload (multiple via image[])
 curl https://your-domain/v1/images/edits \
@@ -160,7 +169,7 @@ curl https://your-domain/v1/images/edits \
   -F model="seedream-4.5" -F prompt="make it cyberpunk" -F image=@input.png
 ```
 
-Images return OpenAI-style `{ "created": ..., "data": [{ "b64_json": "..." }] }` (raw base64, no `data:` prefix, nothing stored server-side). **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
+Synchronous images return OpenAI-style `{ "created": ..., "data": [{ "url": "..." }] }`. Async image submission returns `{ "data": { "task_id": "..." } }`; successful polls provide `data.result_url`. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
 
 ## 🚀 Deployment
 

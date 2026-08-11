@@ -8,7 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -49,6 +53,8 @@ var (
 	ErrProviderExecution   = errors.New("provider request failed")
 	ErrProviderUnsupported = errors.New("provider not implemented")
 	ErrReferenceTooLarge   = errors.New("reference image too large")
+	ErrImageJobNotFound    = errors.New("image job not found")
+	ErrImageNotReady       = errors.New("image is not ready yet")
 	// ErrConcurrencyFull — every eligible account is busy (each account runs at
 	// most ONE generation at a time). English message: surfaced to API / UI.
 	ErrConcurrencyFull = errors.New("all accounts are busy (1 concurrent job each), please try again shortly")
@@ -64,6 +70,11 @@ var (
 // comfortably covers real photos/screenshots; anything larger is almost
 // certainly abuse or a mistake. Mirrors Python core/refs.py.
 const maxReferenceImageBytes = 20 * 1024 * 1024
+
+const (
+	maxReferenceImageURLs   = 16
+	asyncImageStoragePrefix = "async-image:"
+)
 
 type V1Service struct {
 	cfg      *config.Config
@@ -422,6 +433,14 @@ func (s *V1Service) prepareAdminTestImage(ctx context.Context, principal *APIPri
 }
 
 func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, source string, charge bool) (map[string]any, error) {
+	return s.prepareImageExecutionWithStart(ctx, principal, in, source, charge, nil)
+}
+
+// prepareImageExecutionWithStart executes the usual image-generation path and
+// invokes onPending once the charged event is durable and cancellable. Async
+// image submission uses that precise point to return a task ID while preserving
+// the synchronous path's accounting, concurrency, and refund behavior.
+func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, source string, charge bool, onPending func(string)) (map[string]any, error) {
 	// Detach the whole execution from the request lifecycle. The frontend tracks
 	// progress by polling /jobs/mine, so a client disconnect — or an nginx/CDN
 	// gateway timeout on the slow synchronous response — must NOT cancel an
@@ -472,7 +491,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// as base64 inline (OpenAI gpt-image-1 also returns only b64_json) and never
 	// upload to RustFS, so there's no URL. The event is still logged (empty file)
 	// for usage; the customer logs page hides source="v1" rows.
-	noStore := source == "v1"
+	noStore := source == "v1" || source == "v1_async"
 	var fileURL, relativePath string
 	if !noStore {
 		fileURL, relativePath = s.allocateOutput(principal, "png", in.BaseURL)
@@ -492,6 +511,9 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// the row; deregister on return.
 	s.inflight.Add(eventID, cancel)
 	defer s.inflight.Done(eventID)
+	if onPending != nil {
+		onPending(eventID)
+	}
 	startedAt := time.Now()
 
 	var imageBytes []byte
@@ -667,6 +689,13 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			_ = s.store.Put(genCtx, ThumbKey(relativePath), thumb, "image/jpeg")
 		}
 	}
+	if source == "v1_async" {
+		if err := s.storeAsyncImageResult(ctx, principal, eventID, imageBytes, upstreamURL, in.BaseURL); err != nil {
+			_ = s.refundIfNeeded(ctx, principal, eventID, price)
+			_ = s.events.UpdateStatus(ctx, eventID, "failed", "save async result failed: "+err.Error(), 0)
+			return nil, fmt.Errorf("%w: %v", ErrProviderExecution, err)
+		}
+	}
 	elapsedMS := int(time.Since(startedAt).Milliseconds())
 	if err := s.events.UpdateStatus(ctx, eventID, "success", "", elapsedMS); err != nil {
 		return nil, err
@@ -729,6 +758,106 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		"charged":    price,
 		"credits":    principalCredits(principal),
 	}, nil
+}
+
+// StartAsyncImageRequest creates an image event using the same validation,
+// charging, and execution path as POST /v1/images/generations. It waits only
+// until the durable event exists, then leaves generation running in the
+// background and returns the reference-compatible task response.
+func (s *V1Service) StartAsyncImageRequest(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
+	started := make(chan string, 1)
+	finished := make(chan error, 1)
+	go func() {
+		_, err := s.prepareImageExecutionWithStart(ctx, principal, in, "v1_async", true, func(eventID string) {
+			started <- eventID
+		})
+		finished <- err
+	}()
+
+	select {
+	case eventID := <-started:
+		return map[string]any{"data": map[string]any{"task_id": eventID}}, nil
+	case err := <-finished:
+		return nil, err
+	}
+}
+
+// AsyncImageJob returns the GPT Image 2-style task state for an API image
+// request. Task IDs are scoped to the API key owner so they cannot be guessed
+// and read by another account.
+func (s *V1Service) AsyncImageJob(ctx context.Context, principal *APIPrincipal, id, baseURL string) (map[string]any, error) {
+	ev, err := s.asyncImageEventForUser(ctx, principal, id)
+	if err != nil {
+		return nil, err
+	}
+	data := map[string]any{
+		"task_id": ev.ID,
+		"status":  asyncImageStatus(ev),
+	}
+	switch ev.Status {
+	case "success":
+		if strings.TrimSpace(ev.File) == "" {
+			return nil, ErrImageNotReady
+		}
+		resultURL := ev.File
+		if ev.Provider == "chatgpt" || strings.HasPrefix(ev.File, asyncImageStoragePrefix) {
+			resultURL = imageContentURL(baseURL, ev.ID)
+		}
+		data["result_url"] = resultURL
+	case "failed":
+		data["error"] = strings.TrimSpace(ev.Error)
+	}
+	return map[string]any{"data": data}, nil
+}
+
+func (s *V1Service) asyncImageEventForUser(ctx context.Context, principal *APIPrincipal, id string) (*model.EventLog, error) {
+	ev, err := s.events.GetByID(ctx, strings.TrimSpace(id))
+	if err != nil {
+		return nil, err
+	}
+	if ev == nil || ev.Kind != "image" || ev.Source != "v1_async" {
+		return nil, ErrImageJobNotFound
+	}
+	if principal == nil || principal.User == nil || ev.UserID != principal.User.ID {
+		return nil, ErrImageJobNotFound
+	}
+	return ev, nil
+}
+
+func asyncImageStatus(ev *model.EventLog) string {
+	switch ev.Status {
+	case "success":
+		return "SUCCESS"
+	case "failed":
+		return "FAILED"
+	default:
+		return "PENDING"
+	}
+}
+
+// storeAsyncImageResult keeps a pollable URL for every successful async image.
+// Most providers expose a public artifact URL, while ChatGPT's URL is retained
+// for the authenticated /content proxy. Providers without an artifact URL fall
+// back to RustFS and are also served through that proxy.
+func (s *V1Service) storeAsyncImageResult(ctx context.Context, principal *APIPrincipal, eventID string, imageBytes []byte, upstreamURL, baseURL string) error {
+	if upstreamURL = strings.TrimSpace(upstreamURL); upstreamURL != "" {
+		return s.events.SetFile(ctx, eventID, upstreamURL)
+	}
+	if len(imageBytes) == 0 {
+		return errors.New("upstream returned no image result")
+	}
+	_, relativePath := s.allocateOutput(principal, "png", baseURL)
+	if err := s.store.Put(ctx, relativePath, imageBytes, "image/png"); err != nil {
+		return err
+	}
+	return s.events.SetFile(ctx, eventID, asyncImageStoragePrefix+relativePath)
+}
+
+func imageContentURL(baseURL, eventID string) string {
+	if base := strings.TrimRight(strings.TrimSpace(baseURL), "/"); base != "" {
+		return base + "/v1/images/" + eventID + "/content"
+	}
+	return "/v1/images/" + eventID + "/content"
 }
 
 func (s *V1Service) PrepareVideoRequest(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
@@ -1090,14 +1219,33 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 	if err != nil {
 		return nil, "", err
 	}
-	if ev == nil || ev.Kind != "image" {
-		return nil, "", ErrVideoJobNotFound
+	if ev == nil || ev.Kind != "image" || (ev.Source != "v1" && ev.Source != "v1_async") {
+		return nil, "", ErrImageJobNotFound
 	}
 	if principal != nil && principal.User != nil && ev.UserID != principal.User.ID {
-		return nil, "", ErrVideoJobNotFound
+		return nil, "", ErrImageJobNotFound
 	}
 	if ev.Status != "success" || strings.TrimSpace(ev.File) == "" {
-		return nil, "", ErrVideoNotReady
+		return nil, "", ErrImageNotReady
+	}
+	if strings.HasPrefix(ev.File, asyncImageStoragePrefix) {
+		if s.store == nil {
+			return nil, "", fmt.Errorf("%w: image storage is unavailable", ErrProviderTemporary)
+		}
+		key := strings.TrimPrefix(ev.File, asyncImageStoragePrefix)
+		resp, err := s.store.Get(ctx, key, "")
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: fetch async image: %v", ErrProviderTemporary, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, "", fmt.Errorf("%w: async image storage status %d", ErrProviderTemporary, resp.StatusCode)
+		}
+		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		if contentType == "" {
+			contentType = "image/png"
+		}
+		return resp.Body, contentType, nil
 	}
 	if ev.Provider == "chatgpt" && s.chatgpt != nil {
 		if s.settings != nil {
@@ -3430,6 +3578,168 @@ func ensureReferenceSizes(inputs []string) error {
 		}
 	}
 	return nil
+}
+
+// ResolveImageReferences accepts the reference contract used by GPT Image 2:
+// public HTTP(S) image URLs. Existing raw-base64 references remain untouched so
+// the multipart and provider paths stay backward compatible. URL fetching is
+// deliberately SSRF-safe: it rejects local networks, validates each redirect,
+// and dials only a freshly validated public IP address.
+func (s *V1Service) ResolveImageReferences(ctx context.Context, inputs []string) ([]string, error) {
+	if len(inputs) > maxReferenceImageURLs {
+		return nil, fmt.Errorf("too many reference images (maximum %d)", maxReferenceImageURLs)
+	}
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	client := newPublicReferenceHTTPClient()
+	out := make([]string, 0, len(inputs))
+	for _, input := range inputs {
+		value := strings.TrimSpace(input)
+		if value == "" {
+			continue
+		}
+		lower := strings.ToLower(value)
+		if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+			out = append(out, value)
+			continue
+		}
+		imageBytes, err := fetchPublicReferenceImage(ctx, client, value)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, base64.StdEncoding.EncodeToString(imageBytes))
+	}
+	return out, nil
+}
+
+func newPublicReferenceHTTPClient() *http.Client {
+	transport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           dialPublicReference,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return errors.New("too many image URL redirects")
+			}
+			return validatePublicReferenceURL(req.Context(), req.URL)
+		},
+	}
+}
+
+func fetchPublicReferenceImage(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, errors.New("invalid image URL")
+	}
+	if err := validatePublicReferenceURL(ctx, u); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, errors.New("invalid image URL")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch reference image: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("reference image returned HTTP %d", resp.StatusCode)
+	}
+	if resp.ContentLength > maxReferenceImageBytes {
+		return nil, ErrReferenceTooLarge
+	}
+	if contentType := strings.TrimSpace(resp.Header.Get("Content-Type")); contentType != "" {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err != nil || !strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+			return nil, errors.New("reference URL must return an image")
+		}
+	}
+	imageBytes, err := io.ReadAll(io.LimitReader(resp.Body, maxReferenceImageBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read reference image: %w", err)
+	}
+	if len(imageBytes) > maxReferenceImageBytes {
+		return nil, ErrReferenceTooLarge
+	}
+	if len(imageBytes) == 0 {
+		return nil, errors.New("reference image is empty")
+	}
+	return imageBytes, nil
+}
+
+func validatePublicReferenceURL(ctx context.Context, u *url.URL) error {
+	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return errors.New("reference image must use a public http(s) URL")
+	}
+	if port := u.Port(); port != "" && port != "80" && port != "443" {
+		return errors.New("reference image URL port is not allowed")
+	}
+	_, err := publicReferenceIPs(ctx, u.Hostname())
+	return err
+}
+
+func dialPublicReference(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if port != "80" && port != "443" {
+		return nil, errors.New("reference image URL port is not allowed")
+	}
+	ips, err := publicReferenceIPs(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("reference image host has no public address")
+}
+
+func publicReferenceIPs(ctx context.Context, host string) ([]netip.Addr, error) {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return nil, errors.New("reference image URL must be publicly reachable")
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if !isPublicReferenceIP(ip) {
+			return nil, errors.New("reference image URL must not target a private address")
+		}
+		return []netip.Addr{ip.Unmap()}, nil
+	}
+	resolved, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil || len(resolved) == 0 {
+		return nil, errors.New("reference image host could not be resolved")
+	}
+	for _, ip := range resolved {
+		if !isPublicReferenceIP(ip) {
+			return nil, errors.New("reference image URL must not target a private address")
+		}
+	}
+	return resolved, nil
+}
+
+func isPublicReferenceIP(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return ip.IsValid() && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() &&
+		!ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsMulticast() && !ip.IsUnspecified()
 }
 
 func decodeReferenceImages(inputs []string, limit int) ([][]byte, error) {
