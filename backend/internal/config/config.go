@@ -26,6 +26,8 @@ type Config struct {
 	RustFSBucket      string
 	RustFSAccessKey   string
 	RustFSSecretKey   string
+	UpdaterURL        string
+	UpdaterToken      string
 }
 
 func Load() (*Config, error) {
@@ -60,6 +62,8 @@ func Load() (*Config, error) {
 		RustFSBucket:    envString("RUSTFS_BUCKET", ""),
 		RustFSAccessKey: envString("RUSTFS_ACCESS_KEY", ""),
 		RustFSSecretKey: envString("RUSTFS_SECRET_KEY", ""),
+		UpdaterURL:      envString("UPDATER_URL", ""),
+		UpdaterToken:    envString("UPDATER_TOKEN", ""),
 	}
 
 	return cfg, nil

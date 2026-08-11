@@ -30,6 +30,7 @@ const tabs = [
   { label: '首页内容', to: '/admin/showcase', icon: 'spark' },
   { label: '日志管理', to: '/admin/logs', icon: 'log' },
   { label: '系统配置', to: '/admin/config', icon: 'config' },
+  { label: '在线更新', to: '/admin/update', icon: 'download' },
 ]
 
 const currentLabel = computed(() => route.meta?.label || '概览')
