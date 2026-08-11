@@ -790,8 +790,8 @@ func (s *V1Service) StartSessionImageJob(ctx context.Context, principal *APIPrin
 }
 
 // AsyncImageJob returns the task state for an API image request. Pending and
-// failed tasks use the task envelope; a completed task is normalized to the
-// same OpenAI image response as the synchronous endpoint.
+// failed tasks use the task envelope; a completed task uses the upstream
+// asynchronous image response shape.
 func (s *V1Service) AsyncImageJob(ctx context.Context, principal *APIPrincipal, id, baseURL string) (map[string]any, error) {
 	ev, err := s.asyncImageEventForUser(ctx, principal, id)
 	if err != nil {
@@ -819,8 +819,12 @@ func asyncImageSuccessResponse(ev *model.EventLog, baseURL string) (map[string]a
 		resultURL = imageContentURL(baseURL, ev.ID)
 	}
 	return map[string]any{
-		"created": ev.TS.Unix(),
-		"data":    []map[string]any{{"url": resultURL}},
+		"status":       200,
+		"statusText":   "",
+		"imageUrls":    []string{resultURL},
+		"errorPreview": nil,
+		"durationMs":   0,
+		"createdAt":    time.Now().UTC().Format(time.RFC3339Nano),
 	}, nil
 }
 

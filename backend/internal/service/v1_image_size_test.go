@@ -66,7 +66,7 @@ func TestAsyncImageStatus(t *testing.T) {
 	}
 }
 
-func TestAsyncImageSuccessResponseUsesOpenAIShape(t *testing.T) {
+func TestAsyncImageSuccessResponseUsesUpstreamAsyncShape(t *testing.T) {
 	ev := &model.EventLog{
 		ID:       "evt-IMAGE123",
 		Status:   "success",
@@ -78,15 +78,28 @@ func TestAsyncImageSuccessResponseUsesOpenAIShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("asyncImageSuccessResponse returned error: %v", err)
 	}
-	if got, want := response["created"], ev.TS.Unix(); got != want {
-		t.Fatalf("created = %v, want %d", got, want)
+	if got, ok := response["status"].(int); !ok || got != 200 {
+		t.Fatalf("status = %#v, want 200", response["status"])
 	}
-	data, ok := response["data"].([]map[string]any)
-	if !ok || len(data) != 1 || data[0]["url"] != ev.File {
-		t.Fatalf("data = %#v, want one OpenAI image URL", response["data"])
+	if got, ok := response["statusText"].(string); !ok || got != "" {
+		t.Fatalf("statusText = %#v, want empty string", response["statusText"])
 	}
-	if _, ok := response["status"]; ok {
-		t.Fatalf("successful OpenAI response must not include a task status")
+	urls, ok := response["imageUrls"].([]string)
+	if !ok || len(urls) != 1 || urls[0] != ev.File {
+		t.Fatalf("imageUrls = %#v, want one image URL", response["imageUrls"])
+	}
+	if response["errorPreview"] != nil {
+		t.Fatalf("errorPreview = %#v, want nil", response["errorPreview"])
+	}
+	if got, ok := response["durationMs"].(int); !ok || got != 0 {
+		t.Fatalf("durationMs = %#v, want 0", response["durationMs"])
+	}
+	createdAt, ok := response["createdAt"].(string)
+	if !ok {
+		t.Fatalf("createdAt = %#v, want RFC3339 timestamp", response["createdAt"])
+	}
+	if _, err := time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		t.Fatalf("createdAt = %q, want RFC3339 timestamp: %v", createdAt, err)
 	}
 }
 

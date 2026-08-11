@@ -163,13 +163,13 @@ curl https://你的域名/v1/images/generations \
     "image": ["https://example.com/reference-cat.png"]
   }'
 
-# 异步图片 —— 返回 {"data":{"task_id":"..."}}；成功轮询响应将规范化为 OpenAI 图片格式
+# 异步图片 —— 返回 HTTP 202 和 {"data":{"task_id":"..."}}；成功轮询响应含 imageUrls
 curl https://你的域名/v1/images/async/generations \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-image-2","prompt":"a cinematic wheat field","image_size":"2K","aspect_ratio":"16:9"}'
 # 兼容路径: POST /v1/images/generations/async
-# GET /v1/images/async/{task_id} → 未完成/失败: data.status 为 PENDING/FAILED；成功: {"created":...,"data":[{"url":"..."}]}
+# GET /v1/images/async/{task_id} → 未完成/失败: data.status 为 PENDING/FAILED；成功: {"status":200,"statusText":"","imageUrls":["..."],"errorPreview":null,"durationMs":0,"createdAt":"..."}
 
 # 图生图 —— multipart 上传参考图(可多张 image[])
 curl https://你的域名/v1/images/edits \
@@ -177,7 +177,7 @@ curl https://你的域名/v1/images/edits \
   -F model="seedream-4.5" -F prompt="改成赛博朋克风格" -F image=@input.png
 ```
 
-同步图片返回 OpenAI 风格 `{ "created": ..., "data": [{ "url": "..." }] }`。异步图片提交返回 `{ "data": { "task_id": "..." } }`；未完成或失败的轮询结果含 `data.status`，成功结果也规范化为 `{ "created": ..., "data": [{ "url": "..." }] }`。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
+同步图片返回 OpenAI 风格 `{ "created": ..., "data": [{ "url": "..." }] }`。异步图片提交返回 HTTP `202 Accepted` 和 `{ "data": { "task_id": "..." } }`；未完成或失败的轮询结果含 `data.status`，成功结果为 `{ "status": 200, "statusText": "", "imageUrls": ["..."], "errorPreview": null, "durationMs": 0, "createdAt": "..." }`，读取 `imageUrls[0]`。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
 
 ## 🚀 部署
 
