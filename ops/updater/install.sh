@@ -13,6 +13,13 @@ if [[ -z "$repo_dir" || ! -d "$repo_dir/.git" ]]; then
 fi
 repo_dir="$(cd "$repo_dir" && pwd)"
 
+# The updater runs as root so it can operate the host Docker daemon. Mark only
+# this deployment directory as trusted when the checkout belongs to a regular
+# deployment user (for example Ubuntu's default "ubuntu" account).
+if ! git config --system --get-all safe.directory 2>/dev/null | grep -Fxq "$repo_dir"; then
+  git config --system --add safe.directory "$repo_dir"
+fi
+
 install -d -m 0750 /etc/image2api
 if [[ ! -f /etc/image2api/updater.env ]]; then
   install -m 0600 "$repo_dir/ops/updater/updater.env.example" /etc/image2api/updater.env
