@@ -143,14 +143,15 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 ## 🔌 OpenAI-Compatible API
 
 ```bash
-# Text-to-image — pure OpenAI params: size drives both aspect ratio + tier (long edge <1800→1K / <3500→2K / ≥3500→4K)
+# Text-to-image — prefer image_size + aspect_ratio; legacy size (WxH) remains supported
 curl https://your-domain/v1/images/generations \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-image-2",
     "prompt": "a cute cat on a desk, studio lighting",
-    "size": "2048x2048"
+    "image_size": "2K",
+    "aspect_ratio": "16:9"
   }'
 
 # Image-to-image — multipart reference upload (multiple via image[])

@@ -151,14 +151,15 @@
 ## 🔌 OpenAI 兼容 API
 
 ```bash
-# 文生图 —— 纯 OpenAI 参数:size 同时决定比例 + 分辨率档(长边 <1800→1K / <3500→2K / ≥3500→4K)
+# 文生图 —— 推荐 image_size + aspect_ratio；也兼容旧 size(WxH)格式
 curl https://你的域名/v1/images/generations \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-image-2",
     "prompt": "a cute cat on a desk, studio lighting",
-    "size": "2048x2048"
+    "image_size": "2K",
+    "aspect_ratio": "16:9"
   }'
 
 # 图生图 —— multipart 上传参考图(可多张 image[])

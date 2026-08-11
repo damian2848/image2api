@@ -50,13 +50,17 @@ function priceOf(m) {
 const imageParams = [
   ['model', 'string', '必填', '模型名(别名优先),见上表(图像)'],
   ['prompt', 'string', '必填', '文字描述'],
-  ['size', 'string', '可选', '宽x高,如 "1024x1024"。同时决定「比例」+「分辨率档」(按长边)。具体怎么填见下方对照表;留空 = 1:1 · 2K'],
+  ['image_size', 'string', '可选', '分辨率档:"1K" / "2K" / "4K"。与 aspect_ratio 配合使用;留空 = 2K'],
+  ['aspect_ratio', 'string', '可选', '比例,如 "16:9"。与 image_size 配合使用;留空 = 1:1'],
+  ['size', 'string', '可选', '兼容旧格式:宽x高,如 "2048x1152"。若同时传 image_size / aspect_ratio,对应显式字段优先'],
 ]
 const editParams = [
   ['image', 'file', '必填', '输入图;多张参考图重复 image[] 字段(multipart 文件上传)'],
   ['prompt', 'string', '必填', '编辑/参考描述'],
   ['model', 'string', '必填', '模型名(别名优先,需支持图生图)'],
-  ['size', 'string', '可选', '同图像:决定比例 + 分辨率档(见下方对照表)'],
+  ['image_size', 'string', '可选', '同文生图:"1K" / "2K" / "4K"'],
+  ['aspect_ratio', 'string', '可选', '同文生图:如 "16:9"'],
+  ['size', 'string', '可选', '兼容旧格式;与显式字段同时传时,显式字段优先'],
 ]
 const videoParams = [
   ['model', 'string', '必填', '模型名(别名优先),见上表(视频)'],
@@ -112,7 +116,8 @@ const examples = computed(() => [
   -d '{
     "model": "${sampleImage.value}",
     "prompt": "a corgi running in a golden wheat field, cinematic",
-    "size": "2048x2048"
+    "image_size": "2K",
+    "aspect_ratio": "16:9"
   }'`,
   },
   {
@@ -126,7 +131,7 @@ client = OpenAI(api_key="${keyHint.value}", base_url="${base.value}/v1")
 resp = client.images.generate(
     model="${sampleImage.value}",
     prompt="a corgi running in a golden wheat field, cinematic",
-    size="2048x2048",   # 2K · 1:1,见下方对照表
+    extra_body={"image_size": "2K", "aspect_ratio": "16:9"},
 )
 # 结果是图片 URL(上游原始直链,会过期 → 尽快下载/转存)
 urllib.request.urlretrieve(resp.data[0].url, "out.png")`,
@@ -370,8 +375,8 @@ async function copy(text) {
     <section>
       <h2 class="text-lg font-semibold mb-1">图像分辨率对照表 · <code class="text-white/70 text-sm">size</code> 该传什么</h2>
       <p class="text-xs text-white/45 mb-3">
-        左边选比例,上面选分辨率档,交叉格里就是 <code class="text-white/70">size</code> 要传的值(直接复制)。
-        没有 <code class="text-white/70">quality</code> 参数,图像分辨率只看 <code class="text-white/70">size</code> 的<strong class="text-white/70">长边</strong>。
+        推荐直接传 <code class="text-white/70">image_size</code>(1K / 2K / 4K)和 <code class="text-white/70">aspect_ratio</code>(如 16:9)。
+        下表保留旧 <code class="text-white/70">size</code> 格式的像素对照;显式字段优先于从 size 推导出的值。
         档位必须是该模型支持的(见上方「可用模型」的分辨率列),不支持会自动回退到该模型最低档。
       </p>
       <div class="card overflow-hidden">
@@ -393,8 +398,8 @@ async function copy(text) {
         </table>
       </div>
       <p class="text-xs text-white/40 mt-2">
-        例:想要 <strong class="text-white/70">2K 的 16:9 横图</strong> → <code class="text-white/70">"size": "2048x1152"</code>。
-        留空 size = 默认 <strong class="text-white/70">1:1 · 2K</strong>。
+        例:想要 <strong class="text-white/70">2K 的 16:9 横图</strong> → <code class="text-white/70">"image_size": "2K", "aspect_ratio": "16:9"</code>。
+        两个字段都留空时默认为 <strong class="text-white/70">1:1 · 2K</strong>。
       </p>
 
       <!-- 视频分辨率(720p / 1080p,按短边判) -->
