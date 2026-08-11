@@ -2,24 +2,24 @@ package service
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/chatgpt"
 	"backend/internal/provider/creativefabrica"
+	"backend/internal/provider/grok"
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
 	"backend/internal/provider/leonardo"
-	"backend/internal/provider/grok"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
 
@@ -28,14 +28,14 @@ import (
 )
 
 var validTokenPools = map[string]string{
-	"chatgpt":  "openai",
-	"adobe":    "adobe",
-	"runway":   "runway",
-	"leonardo": "leonardo",
-	"krea":     "krea",
-	"imagine":  "imagine",
-	"grok":     "grok",
-	"custom":   "custom",
+	"chatgpt":         "openai",
+	"adobe":           "adobe",
+	"runway":          "runway",
+	"leonardo":        "leonardo",
+	"krea":            "krea",
+	"imagine":         "imagine",
+	"grok":            "grok",
+	"custom":          "custom",
 	"creativefabrica": "creativefabrica",
 }
 
@@ -427,6 +427,11 @@ func (s *TokenService) ImportLeonardoCookie(ctx context.Context, cookie, tokenID
 	// 时它返回 200 null（换不到 accessToken），和死号一模一样，所以导入就拦掉。
 	if !leonardo.HasSessionData(cookie) {
 		return nil, errors.New("leonardo cookie 缺少 __Secure-better-auth.session_data，请复制完整 cookie")
+	}
+	if existing, err := s.tokens.GetByPoolValue(ctx, "leonardo", cookie); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, nil
 	}
 	if tokenID == "" {
 		tokenID = newTokenID("leonardo")
@@ -1036,7 +1041,6 @@ func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID st
 	return item, nil
 }
 
-
 func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1398,6 +1402,34 @@ func (s *TokenService) DeleteBulk(ctx context.Context, ids []string) (int, error
 	// refresher doesn't re-create the tokens.
 	_ = s.refresh.DeleteByIDs(ctx, clean)
 	return int(rows), nil
+}
+
+// SetFreeAllowedBulk sets the Adobe free-account override for a multi-selection.
+// Other provider accounts and Adobe memberships are intentionally skipped: the
+// override has no meaning for them because their normal model policy differs.
+func (s *TokenService) SetFreeAllowedBulk(ctx context.Context, ids []string, allowed bool) (updated, skipped int, err error) {
+	seen := make(map[string]struct{}, len(ids))
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		clean = append(clean, id)
+	}
+	if len(clean) == 0 {
+		return 0, 0, nil
+	}
+	rows, err := s.tokens.SetFreeAllowedByIDs(ctx, clean, allowed)
+	if err != nil {
+		return 0, 0, err
+	}
+	updated = int(rows)
+	return updated, len(clean) - updated, nil
 }
 
 func (s *TokenService) Accounts(ctx context.Context) ([]map[string]any, error) {
@@ -1944,6 +1976,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"dead":              item.Dead,
 		"image_limited":     item.ImageLimited,
 		"video_limited":     item.VideoLimited,
+		"free_allowed":      item.FreeAllowed,
 		"pending":           pending,
 		"sub_account":       subAccount,
 		"plan":              emptyToNil(strings.ToLower(strings.TrimSpace(stringValue(plan)))),

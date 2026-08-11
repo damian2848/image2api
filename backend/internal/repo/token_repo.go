@@ -53,15 +53,56 @@ func (r *TokenRepository) Get(ctx context.Context, pool, id string) (*model.Toke
 }
 
 // GetByPoolEmail finds an account in a pool by its account_email (the logical
-// identity for import dedup). Returns (nil, nil) when none / email is blank.
+// identity for import dedup). Email comparisons are case-insensitive. Returns
+// (nil, nil) when none / email is blank.
 func (r *TokenRepository) GetByPoolEmail(ctx context.Context, pool, email string) (*model.TokenAccount, error) {
-	email = strings.TrimSpace(email)
+	email = strings.ToLower(strings.TrimSpace(email))
 	if email == "" {
 		return nil, nil
 	}
 	var item model.TokenAccount
 	err := r.db.WithContext(ctx).
-		Where("pool = ? AND account_email = ?", pool, email).
+		Where("pool = ? AND LOWER(account_email) = ?", pool, email).
+		First(&item).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+// GetByPoolValue finds an account whose stored credential exactly matches the
+// incoming one. It is a cheap first-line dedup for opaque cookie providers.
+func (r *TokenRepository) GetByPoolValue(ctx context.Context, pool, value string) (*model.TokenAccount, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	var item model.TokenAccount
+	err := r.db.WithContext(ctx).
+		Where("pool = ? AND value = ?", pool, value).
+		First(&item).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+// GetByPoolSessionID finds a Grok account by the session id embedded in its
+// SSO JWT. The JWT may rotate while the logical session stays the same.
+func (r *TokenRepository) GetByPoolSessionID(ctx context.Context, pool, sessionID string) (*model.TokenAccount, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, nil
+	}
+	var item model.TokenAccount
+	err := r.db.WithContext(ctx).
+		Where("pool = ? AND meta ->> 'session_id' = ?", pool, sessionID).
 		First(&item).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
@@ -104,6 +145,20 @@ func (r *TokenRepository) SwapValue(ctx context.Context, pool, id, from, to stri
 	return res.RowsAffected > 0, nil
 }
 
+// SetFreeAllowedByIDs changes the restricted-model override only for Adobe
+// free accounts. The plan lives in meta because it is hydrated from Adobe's
+// credits response, so keep the eligibility check in the same SQL statement.
+func (r *TokenRepository) SetFreeAllowedByIDs(ctx context.Context, ids []string, allowed bool) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	res := r.db.WithContext(ctx).
+		Model(&model.TokenAccount{}).
+		Where("id IN ? AND pool = 'adobe' AND LOWER(COALESCE(meta ->> 'plan', '')) = 'free'", ids).
+		Updates(map[string]any{"free_allowed": allowed, "updated_at": time.Now()})
+	return res.RowsAffected, res.Error
+}
+
 // ReserveQuota atomically pre-deducts `amount` from an account's cached image
 // token balance under a row lock, so concurrent picks of the same near-empty
 // account can never over-commit it. Returns:
@@ -111,6 +166,7 @@ func (r *TokenRepository) SwapValue(ctx context.Context, pool, id, from, to stri
 //   - allowed=true, deducted=false: balance unknown → allowed without a hold
 //     (benefit of the doubt; a post-render reconcile writes the real value).
 //   - allowed=false: balance known and < amount → caller should fail over.
+//
 // RefundQuota releases a hold made with deducted=true when the render fails.
 func (r *TokenRepository) ReserveQuota(ctx context.Context, pool, id string, amount int) (allowed, deducted bool, err error) {
 	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

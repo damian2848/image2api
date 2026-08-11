@@ -90,6 +90,101 @@ function cookieFromAny(item) {
   return ''
 }
 
+function stringClaim(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function firstStringClaim(claims, keys) {
+  for (const key of keys) {
+    const value = stringClaim(claims?.[key])
+    if (value) return value
+  }
+  return ''
+}
+
+function accountIdentityFromJwt(value, type) {
+  const claims = decodeJwtPayload(value)
+  if (!claims || typeof claims !== 'object') return ''
+
+  if (type === 'openai') {
+    const profile = claims['https://api.openai.com/profile']
+    const email = firstStringClaim(profile, ['email'])
+    if (email) return `email:${email.toLowerCase()}`
+  }
+  if (type === 'grok') {
+    const sessionID = firstStringClaim(claims, ['session_id'])
+    if (sessionID) return `session:${sessionID}`
+  }
+
+  const email = firstStringClaim(claims, ['email'])
+  if (email) return `email:${email.toLowerCase()}`
+  if (type === 'runway') {
+    const teamID = firstStringClaim(claims, ['id'])
+    if (teamID) return `team:${teamID}`
+  }
+  return ''
+}
+
+function canonicalCookie(value) {
+  return String(value || '')
+    .replace(/^Cookie:\s*/i, '')
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .sort()
+    .join('; ')
+}
+
+function accountIdentityFromImagine(value) {
+  try {
+    const credential = JSON.parse(value)
+    const email = stringClaim(credential?.email)
+    if (email) return `email:${email.toLowerCase()}`
+    const claims = decodeJwtPayload(credential?.token)
+    const userID = firstStringClaim(claims, ['userId', 'user_id', 'sub'])
+    if (userID) return `user:${userID}`
+    const refreshToken = stringClaim(credential?.refreshToken)
+    if (refreshToken) return `refresh:${refreshToken}`
+  } catch (_) {}
+  return ''
+}
+
+// Return a stable, provider-scoped key for one logical pasted account. Where a
+// provider exposes an account identity in its credential, prefer that identity
+// so renewed JWTs for the same account collapse too. Opaque cookies fall back
+// to a normalized cookie string, which still catches repeated batch entries.
+export function importItemKey(item) {
+  const type = String(item?.type || '')
+  const value = String(item?.value || '').trim()
+  if (!type || !value) return ''
+
+  let identity = ''
+  if (type === 'imagine') identity = accountIdentityFromImagine(value)
+  else if (type === 'openai' || type === 'runway' || type === 'grok') identity = accountIdentityFromJwt(value, type)
+  else identity = canonicalCookie(value)
+
+  return `${type}:${identity || value}`
+}
+
+// Deduplicate a pasted batch before any request is sent. This is intentionally
+// separate from parseImportInput so callers can still display both the detected
+// count and how many credentials were filtered out.
+export function dedupeImportItems(items) {
+  const unique = []
+  const seen = new Set()
+  let skipped = 0
+  for (const item of items || []) {
+    const key = importItemKey(item)
+    if (key && seen.has(key)) {
+      skipped++
+      continue
+    }
+    if (key) seen.add(key)
+    unique.push(item)
+  }
+  return { items: unique, skipped }
+}
+
 /** Returns a list of { type: 'adobe' | 'openai' | 'runway' | 'leonardo', value }. */
 export function parseImportInput(text) {
   text = (text || '').trim()

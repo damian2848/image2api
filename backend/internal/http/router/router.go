@@ -137,6 +137,7 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 		authed.POST("/tokens/import-grok-token", handlers.ProviderAdmin.ImportGrokToken)
 		authed.POST("/tokens/import-custom-account", handlers.ProviderAdmin.ImportCustomAccount)
 		authed.POST("/tokens/delete-bulk", handlers.ProviderAdmin.TokenDeleteBulk)
+		authed.POST("/tokens/free-allowed-bulk", handlers.ProviderAdmin.TokenFreeAllowedBulk)
 		authed.PATCH("/tokens/:pool/:id", handlers.ProviderAdmin.TokenUpdate)
 		authed.DELETE("/tokens/:pool/:id", handlers.ProviderAdmin.TokenDelete)
 		authed.GET("/accounts", handlers.ProviderAdmin.AccountsList)

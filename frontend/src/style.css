@@ -15,18 +15,18 @@ video {
      Drives the app chrome (rails/header) and the public marketing pages.
      The `.dark` class on <html> flips these to the dark values below.
      Text over generated images keeps a literal text-white (handled in markup). */
-  --app-bg: rgb(250 250 251);          /* page background */
-  --fg: rgb(15 23 42);                  /* primary heading/text */
-  --fg-2: rgb(15 23 42 / 0.62);         /* body / secondary */
-  --fg-3: rgb(15 23 42 / 0.45);         /* muted */
-  --fg-faint: rgb(15 23 42 / 0.3);      /* labels / hints */
-  --surface: rgb(255 255 255 / 0.7);    /* raised card on page bg */
-  --surface-2: rgb(15 23 42 / 0.035);   /* subtle inset panel (counter cells) */
-  --hairline: rgb(15 23 42 / 0.08);     /* borders / rings */
-  --hover: rgb(15 23 42 / 0.05);        /* hover wash */
+  --app-bg: rgb(246 247 249);           /* console workspace */
+  --fg: rgb(17 24 39);                  /* primary heading/text */
+  --fg-2: rgb(75 85 99);                /* body / secondary */
+  --fg-3: rgb(107 114 128);             /* muted */
+  --fg-faint: rgb(156 163 175);         /* labels / hints */
+  --surface: rgb(255 255 255);          /* raised surface */
+  --surface-2: rgb(249 250 251);        /* subtle inset panel */
+  --hairline: rgb(229 231 235);         /* borders / rings */
+  --hover: rgb(243 244 246);            /* hover wash */
   /* solid CTA button that sits on the page bg — inverts per theme */
-  --btn-solid-bg: rgb(15 23 42);
-  --btn-solid-bg-h: rgb(30 41 59);
+  --btn-solid-bg: rgb(37 99 235);
+  --btn-solid-bg-h: rgb(29 78 216);
   --btn-solid-fg: #fff;
   --menu-bg: #ffffff;          /* dropdown / popover panel */
 }
@@ -270,7 +270,7 @@ body {
   /* Subtle ambient gradient + grain (used by PublicLayout via .ambient-bg) */
 }
 
-::selection { background: rgb(99 102 241 / 0.22); color: rgb(15 23 42); }
+::selection { background: rgb(37 99 235 / 0.2); color: rgb(17 24 39); }
 
 /* Tailwind v4 / preflight leaves <button> on the default arrow cursor, so
    admins miss the affordance on icon-only actions (复制 / 删除 / 生成 等).
@@ -512,13 +512,13 @@ html.dark .anime-card:hover {
 
 @layer components {
   /* surfaces */
-  .card { @apply bg-white rounded-xl border border-slate-200 shadow-sm; }
+  .card { @apply bg-white rounded-lg border border-slate-200 shadow-none; }
 
   /* buttons — each variant is self-contained (Tailwind v4 can't @apply a custom class) */
   .btn-primary {
     @apply inline-flex items-center justify-center gap-1.5 rounded-lg text-sm font-medium
            transition-colors disabled:opacity-50 disabled:cursor-not-allowed
-           bg-slate-900 text-white hover:bg-slate-700 px-3.5 py-2;
+           bg-blue-600 text-white hover:bg-blue-700 px-3.5 py-2;
   }
   .btn-soft {
     @apply inline-flex items-center justify-center gap-1.5 rounded-lg text-xs font-medium
@@ -538,7 +538,7 @@ html.dark .anime-card:hover {
   .field {
     @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800
            outline-none transition-colors placeholder:text-slate-400
-           focus:border-slate-400 focus:ring-2;
+           focus:border-blue-500 focus:ring-2 focus:ring-blue-100;
   }
 
   /* Native <select> using .field: drop the OS arrow for a custom chevron that

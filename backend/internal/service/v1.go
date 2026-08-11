@@ -22,8 +22,8 @@ import (
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/chatgpt"
-	"backend/internal/provider/custom"
 	"backend/internal/provider/creativefabrica"
+	"backend/internal/provider/custom"
 	"backend/internal/provider/grok"
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
@@ -1758,8 +1758,8 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 			s.markPlanUnknownDead(ctx, "adobe", item.ID)
 			continue
 		}
-		// 普号(free)只能调度 free_allowed 的模型（香蕉2 仅 1K）
-		if !freeAccountsAllowed(modelItem, resolution) && isFreeAccount(item.Meta) {
+		// 普号默认只调度 free_allowed 的模型；账号级显式授权可作为例外。
+		if !adobeAccountCanServeModel(item, modelItem, resolution) {
 			continue
 		}
 		active = append(active, item)
@@ -1838,8 +1838,8 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 		if isSeedanceModel(modelItem.ID) && !isVipMotherAccount(item.Meta) {
 			continue
 		}
-		// 普号(free)只能调度 free_allowed 的模型
-		if !freeAccountsAllowed(modelItem, resolution) && isFreeAccount(item.Meta) {
+		// 普号默认只调度 free_allowed 的模型；账号级显式授权可作为例外。
+		if !adobeAccountCanServeModel(item, modelItem, resolution) {
 			continue
 		}
 		active = append(active, item)
@@ -2964,8 +2964,8 @@ const leonardoPrivateSuffix = "-不卡人脸"
 type leonardoVideoSpec struct {
 	upstream string
 	// long/short 是长边/短边像素,按比例组合成 16:9 或 9:16。
-	long  int
-	short int
+	long      int
+	short     int
 	maxImages int
 	maxAudios int
 	maxVideos int
@@ -4022,6 +4022,12 @@ func freeAccountsAllowed(modelItem *model.ModelConfig, resolution string) bool {
 		return strings.EqualFold(strings.TrimSpace(resolution), "1K")
 	}
 	return true
+}
+
+// adobeAccountCanServeModel applies the normal model-level free-account policy
+// with a deliberate account-level override set by an administrator.
+func adobeAccountCanServeModel(account model.TokenAccount, modelItem *model.ModelConfig, resolution string) bool {
+	return !isFreeAccount(account.Meta) || account.FreeAllowed || freeAccountsAllowed(modelItem, resolution)
 }
 
 func isFreeAccount(meta map[string]interface{}) bool {
