@@ -91,7 +91,7 @@
 
 #### 🔌 OpenAI 兼容
 - 文生图 `/v1/images/generations` · 异步图片 `/v1/images/async/generations` → 轮询 `/v1/images/async/{task_id}` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`
-- 图像支持 `image_size`(1K/2K/4K) + `aspect_ratio` 与 `image` 公网参考图 URL 数组;旧 `size`(WxH)仍可用。视频 `size` 按短边映射 720p/1080p
+- 图像支持 `image_size`(1K/2K/4K) + `aspect_ratio` 与 `image` 公网参考图 URL（单个字符串或数组）;旧 `size`(WxH)仍可用。视频 `size` 按短边映射 720p/1080p
 - 图片结果返回 URL；站内 **/docs** 附完整同步、异步和分辨率示例
 
 #### 🔁 多账号池 + 智能故障转移

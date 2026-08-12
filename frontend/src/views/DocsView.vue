@@ -52,7 +52,7 @@ const imageParams = [
   ['prompt', 'string', '必填', '文字描述'],
   ['image_size', 'string', '可选', '分辨率档:"1K" / "2K" / "4K"。与 aspect_ratio 配合使用;留空 = 2K'],
   ['aspect_ratio', 'string', '可选', '比例,如 "16:9"。与 image_size 配合使用;留空 = 1:1'],
-  ['image', 'string[]', '可选', '公网参考图 URL 数组;支持一张或多张,服务端会安全下载后转发给模型'],
+  ['image', 'string|string[]', '可选', '公网参考图 URL;可传单个字符串或数组,服务端会安全下载后转发给模型'],
   ['size', 'string', '可选', '兼容旧格式:宽x高,如 "2048x1152"。若同时传 image_size / aspect_ratio,对应显式字段优先'],
 ]
 const editParams = [
