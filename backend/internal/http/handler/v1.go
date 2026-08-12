@@ -19,18 +19,42 @@ type V1Handler struct {
 }
 
 type imageGenerationBody struct {
-	Model          string   `json:"model"`
-	Prompt         string   `json:"prompt"`
-	N              int      `json:"n"`
-	Size           string   `json:"size"`
-	ImageSize      string   `json:"image_size"`
-	AspectRatio    string   `json:"aspect_ratio"`
-	Quality        string   `json:"quality"`
-	Image          []string `json:"image"`
-	ResponseFormat string   `json:"response_format"`
-	Background     string   `json:"background"`
-	OutputFormat   string   `json:"output_format"`
-	User           string   `json:"user"`
+	Model          string          `json:"model"`
+	Prompt         string          `json:"prompt"`
+	N              int             `json:"n"`
+	Size           string          `json:"size"`
+	ImageSize      string          `json:"image_size"`
+	AspectRatio    string          `json:"aspect_ratio"`
+	Quality        string          `json:"quality"`
+	Image          imageReferences `json:"image"`
+	ResponseFormat string          `json:"response_format"`
+	Background     string          `json:"background"`
+	OutputFormat   string          `json:"output_format"`
+	User           string          `json:"user"`
+}
+
+// imageReferences accepts both OpenAI-compatible image arrays and the single
+// URL form used by some GPT Image async clients. The service still receives a
+// slice, so all existing reference-image validation remains in one place.
+type imageReferences []string
+
+func (r *imageReferences) UnmarshalJSON(data []byte) error {
+	var list []string
+	if err := json.Unmarshal(data, &list); err == nil {
+		*r = list
+		return nil
+	}
+
+	var single string
+	if err := json.Unmarshal(data, &single); err != nil {
+		return errors.New("image must be a URL string or an array of URL strings")
+	}
+	if single == "" {
+		*r = nil
+		return nil
+	}
+	*r = []string{single}
+	return nil
 }
 
 func NewV1Handler(v1 *service.V1Service) *V1Handler {
@@ -137,7 +161,7 @@ func (h *V1Handler) imageGenerationRequest(c *gin.Context) (service.V1ImageReque
 	if err := c.ShouldBindJSON(&body); err != nil {
 		return service.V1ImageRequest{}, errors.New("invalid request body")
 	}
-	references, err := h.v1.ResolveImageReferences(c.Request.Context(), body.Image)
+	references, err := h.v1.ResolveImageReferences(c.Request.Context(), []string(body.Image))
 	if err != nil {
 		return service.V1ImageRequest{}, err
 	}
