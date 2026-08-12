@@ -28,6 +28,13 @@ if [[ ! -f /etc/image2api/updater.env ]]; then
   echo "Fill UPDATER_TOKEN in /etc/image2api/updater.env before starting the service." >&2
 fi
 
+# The backend reaches the host through Docker's bridge gateway. Do not bind the
+# updater to all interfaces; the bridge address is inaccessible from the public
+# network but reachable as host.docker.internal from this Compose project.
+if ! grep -q '^IMAGE2API_UPDATER_LISTEN=' /etc/image2api/updater.env; then
+  printf '\nIMAGE2API_UPDATER_LISTEN=172.17.0.1:7070\n' >> /etc/image2api/updater.env
+fi
+
 if command -v go >/dev/null 2>&1; then
   (cd "$repo_dir/ops/updater" && go build -trimpath -buildvcs=false -ldflags='-s -w' -o /usr/local/bin/image2api-updater .)
 elif command -v docker >/dev/null 2>&1; then

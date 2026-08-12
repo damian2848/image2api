@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestGitHubRepoFromOrigin(t *testing.T) {
 	cases := map[string]string{
@@ -14,6 +17,20 @@ func TestGitHubRepoFromOrigin(t *testing.T) {
 		if got := githubRepoFromOrigin(origin); got != want {
 			t.Errorf("githubRepoFromOrigin(%q) = %q, want %q", origin, got, want)
 		}
+	}
+}
+
+func TestValidateListenAddressRejectsPublicAndWildcardHosts(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:7070", "43.128.10.245:7070", "example.com:7070", "bad"} {
+		if err := validateListenAddress(address); err == nil {
+			t.Errorf("validateListenAddress(%q) accepted an unsafe address", address)
+		}
+	}
+}
+
+func TestDockerBridgeAddressLookup(t *testing.T) {
+	if isDockerBridgeAddress(net.ParseIP("203.0.113.20")) {
+		t.Fatal("unexpected Docker bridge match for documentation address")
 	}
 }
 

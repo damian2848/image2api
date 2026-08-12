@@ -21,9 +21,10 @@ UPDATER_TOKEN=<粘贴 `openssl rand -hex 32` 的输出>
 IMAGE2API_REPO=/opt/image2api
 IMAGE2API_GITHUB_REPO=damian2848/image2api
 IMAGE2API_COMPOSE_FILES=docker-compose.yml,docker-compose.prod.yml
+IMAGE2API_UPDATER_LISTEN=172.17.0.1:7070
 ```
 
-把同一个密钥写入部署目录的 `.env`，供 `backend` 容器连接仅监听本机回环地址的更新器：
+把同一个密钥写入部署目录的 `.env`，供 `backend` 容器连接仅监听 Docker 网桥地址的更新器：
 
 ```dotenv
 UPDATER_URL=http://host.docker.internal:7070

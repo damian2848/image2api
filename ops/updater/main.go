@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -69,7 +70,7 @@ type server struct {
 
 func main() {
 	var (
-		listen       = flag.String("listen", "127.0.0.1:7070", "HTTP listen address (must stay loopback)")
+		listen       = flag.String("listen", "127.0.0.1:7070", "HTTP listen address (loopback or Docker bridge)")
 		repoDir      = flag.String("repo", "", "absolute path of the image2api Git working tree")
 		githubRepo   = flag.String("github-repo", "damian2848/image2api", "trusted GitHub repository, owner/name")
 		composeFiles = flag.String("compose-files", "docker-compose.yml,docker-compose.prod.yml", "comma-separated compose files, relative to repo")
@@ -78,8 +79,8 @@ func main() {
 	)
 	flag.Parse()
 
-	if !strings.HasPrefix(*listen, "127.0.0.1:") && !strings.HasPrefix(*listen, "[::1]:") {
-		log.Fatal("refusing a non-loopback listen address")
+	if err := validateListenAddress(*listen); err != nil {
+		log.Fatal(err)
 	}
 	if !filepath.IsAbs(*repoDir) {
 		log.Fatal("-repo must be an absolute path")
@@ -121,6 +122,47 @@ func main() {
 	if err := http.ListenAndServe(s.cfg.listen, s.authorize(mux)); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// validateListenAddress allows only loopback or the locally configured Docker
+// bridge address. The latter is needed for a container to reach the updater as
+// host.docker.internal, while still refusing every public network interface.
+func validateListenAddress(raw string) error {
+	host, _, err := net.SplitHostPort(raw)
+	if err != nil {
+		return fmt.Errorf("invalid listen address: %w", err)
+	}
+	if host == "127.0.0.1" || host == "::1" {
+		return nil
+	}
+	addr := net.ParseIP(host)
+	if addr == nil || !addr.IsPrivate() || !isDockerBridgeAddress(addr) {
+		return errors.New("refusing a listen address outside the local Docker bridge")
+	}
+	return nil
+}
+
+func isDockerBridgeAddress(want net.IP) bool {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range interfaces {
+		if iface.Name != "docker0" {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return false
+		}
+		for _, addr := range addrs {
+			ip, _, err := net.ParseCIDR(addr.String())
+			if err == nil && ip.Equal(want) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func splitList(raw string) []string {
