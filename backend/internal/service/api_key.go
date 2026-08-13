@@ -25,19 +25,11 @@ func (s *APIKeyService) Current(ctx context.Context, userID string) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	if len(keys) == 0 {
-		return map[string]any{"key": nil}, nil
+	items := make([]map[string]any, 0, len(keys))
+	for _, key := range keys {
+		items = append(items, apiKeyData(key))
 	}
-	key := keys[0]
-	return map[string]any{
-		"key": map[string]any{
-			"id":           key.ID,
-			"name":         key.Name,
-			"key_preview":  key.KeyPreview,
-			"created_at":   key.CreatedAt,
-			"last_used_at": key.LastUsedAt,
-		},
-	}, nil
+	return map[string]any{"keys": items}, nil
 }
 
 func (s *APIKeyService) Mint(ctx context.Context, userID string) (map[string]any, error) {
@@ -46,20 +38,20 @@ func (s *APIKeyService) Mint(ctx context.Context, userID string) (map[string]any
 		return nil, err
 	}
 	key := &model.APIKey{
-		ID:         "k-" + time.Now().Format("150405") + randomSuffix(2),
+		ID:         newAPIKeyID(),
 		UserID:     userID,
-		Name:       "default",
+		Name:       "API Key",
+		Plaintext:  plain,
 		KeyPreview: previewAPIKey(plain),
 		KeyHash:    hashAPIKey(plain),
 		CreatedAt:  time.Now(),
 	}
-	if err := s.keys.ReplaceForUser(ctx, userID, key); err != nil {
+	if err := s.keys.Create(ctx, key); err != nil {
 		return nil, err
 	}
 	return map[string]any{
-		"ok":      true,
-		"key":     plain,
-		"preview": key.KeyPreview,
+		"ok":   true,
+		"data": apiKeyData(*key),
 	}, nil
 }
 
@@ -67,46 +59,25 @@ func (s *APIKeyService) Revoke(ctx context.Context, userID string) error {
 	return s.keys.DeleteByUserID(ctx, userID)
 }
 
-func (s *APIKeyService) MintNamed(ctx context.Context, userID, name string, replace bool) (map[string]any, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = "default"
-	}
-	plain, err := generatePlainAPIKey()
-	if err != nil {
-		return nil, err
-	}
-	key := &model.APIKey{
-		ID:         "k-" + time.Now().Format("150405") + randomSuffix(2),
-		UserID:     userID,
-		Name:       name,
-		KeyPreview: previewAPIKey(plain),
-		KeyHash:    hashAPIKey(plain),
-		CreatedAt:  time.Now(),
-	}
-	if replace {
-		if err := s.keys.ReplaceForUser(ctx, userID, key); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := s.keys.Create(ctx, key); err != nil {
-			return nil, err
-		}
-	}
-	return map[string]any{
-		"ok":      true,
-		"key":     plain,
-		"preview": key.KeyPreview,
-		"id":      key.ID,
-		"name":    key.Name,
-	}, nil
-}
-
 func (s *APIKeyService) DeleteOne(ctx context.Context, userID, keyID string) error {
 	if strings.TrimSpace(keyID) == "" {
 		return errors.New("key id required")
 	}
 	return s.keys.DeleteByID(ctx, userID, keyID)
+}
+
+func apiKeyData(key model.APIKey) map[string]any {
+	return map[string]any{
+		"id":           key.ID,
+		"name":         key.Name,
+		"key":          key.Plaintext,
+		"created_at":   key.CreatedAt,
+		"last_used_at": key.LastUsedAt,
+	}
+}
+
+func newAPIKeyID() string {
+	return "k-" + time.Now().Format("150405") + randomSuffix(10)
 }
 
 func generatePlainAPIKey() (string, error) {

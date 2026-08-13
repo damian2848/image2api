@@ -7,6 +7,7 @@ import { openPayment } from '../payment'
 import Icon from '../components/Icon.vue'
 import { points, pointsLabel } from '../credits'
 import { site } from '../site'
+import { copyText } from '../utils/clipboard'
 
 const router = useRouter()
 
@@ -26,53 +27,34 @@ onMounted(async () => {
   }
 })
 
-// ---- API Key (REAL: minted + verified server-side; OpenAI-compatible) ----
-// The full plaintext is returned only once, right after minting. On reload we
-// only have the server's masked preview (the plaintext is never stored).
-const apiKey = ref('')        // full plaintext — present only right after minting
-const keyPreview = ref('')    // masked preview from the server (persists)
-const apiKeyRevealed = ref(false)
-const hasKey = computed(() => !!apiKey.value || !!keyPreview.value)
+// ---- API Keys (stored as plaintext at the user's request) ----
+const apiKeys = ref([])
+const hasKeys = computed(() => apiKeys.value.length > 0)
 
-async function loadKey() {
+async function loadKeys() {
   const r = await api('/auth/api-key')
-  if (r.ok) keyPreview.value = r.data?.key?.key_preview || ''
+  if (r.ok) apiKeys.value = r.data?.keys || []
 }
-onMounted(loadKey)
-
-// Uniform mask for the hidden / persisted state — always "***" so the just-minted
-// preview and the server-stored preview read the same (no sk-xxx…yyyy mismatch).
-const maskedKey = computed(() => (apiKey.value || keyPreview.value) ? '***' : '')
+onMounted(loadKeys)
 
 async function generateKey() {
-  if (hasKey.value && !confirm('已有 Key — 重新生成会让旧 Key 立刻失效,确认?')) return
   const r = await api('/auth/api-key', jsonBody('POST', {}))
   if (!r.ok) { toast(r.data?.detail || '生成失败'); return }
-  apiKey.value = r.data.key
-  keyPreview.value = r.data.preview || ''
-  apiKeyRevealed.value = true
-  toast('新 Key 已生成 — 请立刻复制保存(只显示这一次)')
+  await loadKeys()
+  toast('新 API Key 已生成')
 }
 
-// Only the just-minted plaintext is copyable — the server-side preview is a mask
-// (…abcd), so copying it would hand out a key that can never authenticate.
-async function copyKey() {
-  if (!apiKey.value) {
-    toast('完整 Key 仅生成时显示一次,已无法找回 — 请重新生成')
-    return
-  }
-  try {
-    await navigator.clipboard.writeText(apiKey.value)
-    toast('已复制完整 Key')
-  } catch { toast('复制失败') }
+async function copyKey(key) {
+  if (!key.key) { toast('该历史 Key 未保存明文，无法复制'); return }
+  toast((await copyText(key.key)) ? '已复制 API Key' : '复制失败')
 }
 
-async function clearKey() {
-  if (!confirm('清除 Key? 之后用该 Key 的调用都会失败。')) return
-  const r = await api('/auth/api-key', { method: 'DELETE' })
-  if (!r.ok) { toast(r.data?.detail || '清除失败'); return }
-  apiKey.value = ''; keyPreview.value = ''; apiKeyRevealed.value = false
-  toast('已清除 API Key')
+async function deleteKey(key) {
+  if (!confirm(`删除 ${key.name || 'API Key'}? 使用该 Key 的调用将立即失效。`)) return
+  const r = await api(`/auth/api-key/${key.id}`, { method: 'DELETE' })
+  if (!r.ok) { toast(r.data?.detail || '删除失败'); return }
+  apiKeys.value = apiKeys.value.filter((item) => item.id !== key.id)
+  toast('API Key 已删除')
 }
 
 // ---- Password (real: verifies current password server-side) ----
@@ -167,7 +149,7 @@ async function logout() {
   const stale = ['gw_api_key', 'gw_credits', 'gw_checkin_last', 'gw_checkin_streak',
     'gw_invite_code', 'gw_invite_count', 'gw_invite_earned']
   stale.forEach((k) => localStorage.removeItem(k))
-  apiKey.value = ''
+  apiKeys.value = []
   toast('已退出登录')
   setTimeout(() => router.push('/'), 600)
 }
@@ -281,48 +263,43 @@ async function recharge() {
               </div>
               <h2 class="text-xl font-bold mt-4">API Key</h2>
               <p class="text-sm text-white/50 mt-2 leading-relaxed">
-                调用 <code class="bg-white/10 text-white/90 px-1 py-0.5 rounded text-xs">/v1/*</code> 接口需要的访问密钥。完整密钥不保存，仅生成时显示一次。
+                调用 <code class="bg-white/10 text-white/90 px-1 py-0.5 rounded text-xs">/v1/*</code> 接口需要的访问密钥。可创建多个 Key，并随时复制。
               </p>
             </div>
             <div>
-              <label class="block text-xs text-white/50 mb-2">当前密钥</label>
-
-              <!-- has a key -->
-              <div v-if="hasKey" class="rounded-xl bg-white/[0.05] ring-1 ring-white/10 px-4 py-3 flex items-center gap-3">
-                <code class="flex-1 font-mono text-sm text-white/90 break-all">{{ apiKeyRevealed && apiKey ? apiKey : maskedKey }}</code>
-                <button v-if="apiKey" @click="apiKeyRevealed = !apiKeyRevealed"
-                        class="text-xs rounded-lg px-2.5 py-1.5 ring-1 ring-white/10 hover:bg-white/[0.06] hover:ring-white/20 transition-all whitespace-nowrap">
-                  {{ apiKeyRevealed ? '隐藏' : '显示' }}
-                </button>
-                <button @click="copyKey"
-                        :title="apiKey ? '复制完整 Key' : '完整 Key 仅生成时显示一次，已无法找回'"
-                        class="text-xs rounded-lg px-2.5 py-1.5 ring-1 ring-white/10 transition-all hover:bg-white/[0.06] hover:ring-white/20"
-                        :class="!apiKey && 'opacity-40'">
-                  复制
-                </button>
-              </div>
-
-              <!-- no key -->
-              <div v-else class="rounded-xl border border-dashed border-white/15 px-4 py-5 text-center text-xs text-white/40">
-                还没有 Key — 点下面的「生成」按钮自动生成
-              </div>
-
-              <p v-if="apiKey" class="text-[11px] text-amber-300/80 mt-2">⚠ 完整 Key 仅显示这一次,请立刻复制保存。</p>
-
-              <!-- actions -->
-              <div class="mt-3 flex gap-2">
+              <div class="flex items-center justify-between gap-3 mb-2">
+                <label class="block text-xs text-white/50">API Key 列表</label>
                 <button @click="generateKey"
-                        class="rounded-xl bg-white text-black hover:bg-white/90 px-5 py-2.5 text-sm font-semibold transition-colors">
-                  {{ hasKey ? '重新生成' : '生成 Key' }}
+                        class="inline-flex items-center gap-1.5 rounded-lg bg-white text-black hover:bg-white/90 px-3 py-1.5 text-xs font-semibold transition-colors">
+                  <Icon name="plus" class="w-3.5 h-3.5" /> 新建 Key
                 </button>
-                <button v-if="hasKey" @click="clearKey"
-                        class="rounded-xl ring-1 ring-rose-500/30 text-rose-300 hover:bg-rose-500/15 px-4 py-2.5 text-sm transition-colors">
-                  清除
-                </button>
+              </div>
+
+              <div v-if="hasKeys" class="overflow-hidden rounded-xl ring-1 ring-white/10 divide-y divide-white/10">
+                <div v-for="key in apiKeys" :key="key.id" class="bg-white/[0.05] px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-2">
+                  <div class="min-w-0 flex-1">
+                    <div class="text-[11px] text-white/40 mb-1">{{ key.name || 'API Key' }}</div>
+                    <code class="block font-mono text-sm text-white/90 break-all">{{ key.key || key.key_preview }}</code>
+                  </div>
+                  <div class="flex items-center gap-1.5 shrink-0">
+                    <button @click="copyKey(key)" :disabled="!key.key" title="复制 API Key"
+                            class="grid place-items-center w-8 h-8 rounded-lg ring-1 ring-white/10 hover:bg-white/[0.08] hover:ring-white/20 transition-colors disabled:opacity-35 disabled:cursor-not-allowed">
+                      <Icon name="copy" class="w-3.5 h-3.5" />
+                    </button>
+                    <button @click="deleteKey(key)" title="删除 API Key"
+                            class="grid place-items-center w-8 h-8 rounded-lg text-rose-300 ring-1 ring-rose-500/30 hover:bg-rose-500/15 transition-colors">
+                      <Icon name="trash" class="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div v-else class="rounded-xl border border-dashed border-white/15 px-4 py-5 text-center text-xs text-white/40">
+                还没有 Key，点击「新建 Key」创建
               </div>
 
               <p class="text-[11px] text-white/40 mt-3">
-                Key 由系统随机生成,不能手动填写。重新生成会让旧 Key 立刻失效。完整调用示例见
+                Key 由系统随机生成，不能手动填写。删除单条 Key 不影响其他 Key。完整调用示例见
                 <router-link to="/docs" class="text-violet-300 underline">接口文档</router-link>。
               </p>
             </div>

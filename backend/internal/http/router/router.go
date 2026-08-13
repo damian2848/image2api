@@ -209,6 +209,7 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 		authGroup.POST("/change-password", handlers.Auth.ChangePassword)
 		authGroup.GET("/api-key", handlers.UserTools.APIKeyGet)
 		authGroup.POST("/api-key", handlers.UserTools.APIKeyMint)
+		authGroup.DELETE("/api-key/:key_id", handlers.UserTools.APIKeyDeleteOne)
 		authGroup.DELETE("/api-key", handlers.UserTools.APIKeyDelete)
 		authGroup.POST("/redeem-cdk", handlers.UserTools.RedeemCDK)
 	}

@@ -269,9 +269,10 @@ func (s *AdminWriteService) CreateUserAPIKey(ctx context.Context, userID, name s
 		name = "admin"
 	}
 	key := &model.APIKey{
-		ID:         "k-" + time.Now().Format("150405") + randomSuffix(2),
+		ID:         newAPIKeyID(),
 		UserID:     userID,
 		Name:       name,
+		Plaintext:  plain,
 		KeyPreview: previewAPIKey(plain),
 		KeyHash:    hashAPIKey(plain),
 		CreatedAt:  time.Now(),
