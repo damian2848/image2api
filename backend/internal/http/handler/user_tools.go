@@ -61,6 +61,19 @@ func (h *UserToolsHandler) APIKeyDelete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
+func (h *UserToolsHandler) APIKeyDeleteOne(c *gin.Context) {
+	user := currentUser(c)
+	if user == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"detail": "未登录或会话已过期"})
+		return
+	}
+	if err := h.keys.DeleteOne(c.Request.Context(), user.ID, c.Param("key_id")); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "failed to delete api key"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 func (h *UserToolsHandler) RedeemCDK(c *gin.Context) {
 	user := currentUser(c)
 	if user == nil {

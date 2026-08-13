@@ -24,15 +24,6 @@ func (r *APIKeyRepository) ListByUserID(ctx context.Context, userID string) ([]m
 	return keys, nil
 }
 
-func (r *APIKeyRepository) ReplaceForUser(ctx context.Context, userID string, key *model.APIKey) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("user_id = ?", userID).Delete(&model.APIKey{}).Error; err != nil {
-			return err
-		}
-		return tx.Create(key).Error
-	})
-}
-
 func (r *APIKeyRepository) DeleteByUserID(ctx context.Context, userID string) error {
 	return r.db.WithContext(ctx).Where("user_id = ?", userID).Delete(&model.APIKey{}).Error
 }

@@ -62,6 +62,7 @@ type APIKey struct {
 	ID         string `gorm:"primaryKey;size:32"`
 	UserID     string `gorm:"size:32;index;not null"`
 	Name       string `gorm:"size:100;not null"`
+	Plaintext  string `gorm:"size:64"`
 	KeyPreview string `gorm:"size:32;not null"`
 	KeyHash    string `gorm:"size:255;uniqueIndex;not null"`
 	CreatedAt  time.Time
