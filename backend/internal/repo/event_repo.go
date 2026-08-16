@@ -452,9 +452,10 @@ func (r *EventRepository) ClearRefFiles(ctx context.Context, eventID string) err
 		Update("ref_files", nil).Error
 }
 
-// stalePendingWhere selects pending rows past their per-kind deadline: video
-// rows against videoCutoff, everything else against the plain cutoff.
-const stalePendingWhere = "status = ? AND ((kind = ? AND ts < ?) OR (kind <> ? AND ts < ?))"
+// stalePendingWhere selects pending rows past their per-kind deadline. Durable
+// async jobs that are still queued are excluded; once a worker owns one, its
+// processing timestamp (updated_at) starts the normal image timeout budget.
+const stalePendingWhere = "status = ? AND COALESCE(queue_state, '') <> 'queued' AND ((kind = ? AND ts < ?) OR (kind <> ? AND (CASE WHEN queue_state = 'processing' THEN updated_at ELSE ts END) < ?))"
 
 // StaleEvent identifies a purged pending event so the caller can refund the
 // credits debited up-front AND attribute the failure to the account the
@@ -500,9 +501,10 @@ func (r *EventRepository) PurgeStale(ctx context.Context, maxAge, videoMaxAge ti
 		return tx.Model(&model.EventLog{}).
 			Where(stalePendingWhere, "pending", "video", videoCutoff, "video", cutoff).
 			Updates(map[string]any{
-				"status":     "failed",
-				"error":      gorm.Expr("COALESCE(NULLIF(error, ''), ?)", "abandoned (process restarted or request interrupted)"),
-				"updated_at": time.Now(),
+				"status":      "failed",
+				"queue_state": "",
+				"error":       gorm.Expr("COALESCE(NULLIF(error, ''), ?)", "abandoned (process restarted or request interrupted)"),
+				"updated_at":  time.Now(),
 			}).Error
 	})
 	if err != nil {
@@ -601,11 +603,32 @@ func (r *EventRepository) SetFile(ctx context.Context, eventID, fileURL string) 
 		Update("file", fileURL).Error
 }
 
+// SetQueueState records durable async image ownership without changing the
+// public pending/success/failed status. Only pending events can transition.
+func (r *EventRepository) SetQueueState(ctx context.Context, eventID, state string) error {
+	return r.db.WithContext(ctx).
+		Model(&model.EventLog{}).
+		Where("id = ? AND status = ?", eventID, "pending").
+		Updates(map[string]any{"queue_state": strings.TrimSpace(state), "updated_at": time.Now()}).Error
+}
+
+// MarkQueuedIfUnstarted avoids racing a fast worker: enqueue may publish before
+// the producer stamps queued, but it must never overwrite processing.
+func (r *EventRepository) MarkQueuedIfUnstarted(ctx context.Context, eventID string) error {
+	return r.db.WithContext(ctx).
+		Model(&model.EventLog{}).
+		Where("id = ? AND status = ? AND COALESCE(queue_state, '') = ''", eventID, "pending").
+		Updates(map[string]any{"queue_state": "queued", "updated_at": time.Now()}).Error
+}
+
 func (r *EventRepository) UpdateStatus(ctx context.Context, eventID, status, errMsg string, elapsedMS int) error {
 	patch := map[string]any{
 		"status":     status,
 		"elapsed_ms": elapsedMS,
 		"updated_at": time.Now(),
+	}
+	if status == "success" || status == "failed" {
+		patch["queue_state"] = ""
 	}
 	if strings.TrimSpace(errMsg) != "" {
 		patch["error"] = strings.TrimSpace(errMsg)

@@ -119,6 +119,10 @@ type V1Service struct {
 	// upstream gate (1+ jobs per account) and the per-user gate (画图台 + API key,
 	// capped by the user's concurrency group). Self-healing + fail-open.
 	conc *ConcurrencyService
+
+	// asyncImages persists /v1 async image work in Redis and executes it through
+	// an independent worker pool. Synchronous and playground requests bypass it.
+	asyncImages *AsyncImageQueue
 }
 
 // acctAcquire takes one per-account upstream slot (capped at max; 0/1 = single),
@@ -228,6 +232,11 @@ type V1ImageRequest struct {
 	// AccountID pins the generation to one specific provider account (admin
 	// account-test). Empty keeps the normal pool selection with failover.
 	AccountID string
+
+	// existingEventID is used only by the persistent async worker. It resumes the
+	// charged event created at enqueue time instead of charging/logging a second
+	// event. It is unexported so public request decoding can never set it.
+	existingEventID string
 }
 
 type V1VideoRequest struct {
@@ -461,9 +470,9 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 }
 
 // prepareImageExecutionWithStart executes the usual image-generation path and
-// invokes onPending once the charged event is durable and cancellable. Async
-// image submission uses that precise point to return a task ID while preserving
-// the synchronous path's accounting, concurrency, and refund behavior.
+// invokes onPending once the charged event is durable and cancellable. A
+// persistent queue worker sets in.existingEventID to resume an already charged
+// event without creating or charging a second one.
 func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, source string, charge bool, onPending func(string)) (map[string]any, error) {
 	// Detach the whole execution from the request lifecycle. The frontend tracks
 	// progress by polling /jobs/mine, so a client disconnect — or an nginx/CDN
@@ -480,7 +489,27 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	// generation from running on for minutes and surfacing a late "success" on an
 	// already-abandoned event.
 	ctx = context.WithoutCancel(ctx)
-	if source != "admin" {
+	resumeEventID := strings.TrimSpace(in.existingEventID)
+	var resumeEvent *model.EventLog
+	if resumeEventID != "" {
+		var loadErr error
+		resumeEvent, loadErr = s.events.GetByID(ctx, resumeEventID)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if resumeEvent == nil {
+			return nil, ErrImageJobNotFound
+		}
+		if resumeEvent.Status == "success" || resumeEvent.Status == "failed" {
+			return nil, nil
+		}
+		in.Model = resumeEvent.Model
+		in.Prompt = resumeEvent.Prompt
+		in.AspectRatio = resumeEvent.Ratio
+		in.Resolution = resumeEvent.Resolution
+		in.DeAI = resumeEvent.DeAI
+	}
+	if source != "admin" && resumeEvent == nil {
 		if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
 			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, err.Error())
 			return nil, err
@@ -488,7 +517,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	}
 	// 去AI特征 is gated by a system-settings switch (default off) — drop the
 	// flag when disabled so no surcharge is charged and no processing runs.
-	if in.DeAI && !s.deaiEnabled(ctx) {
+	if resumeEvent == nil && in.DeAI && !s.deaiEnabled(ctx) {
 		in.DeAI = false
 	}
 	genCtx, cancel := context.WithTimeout(ctx, 8*time.Minute)
@@ -498,19 +527,40 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	// exempt. Held for the whole generation; released on return.
 	if source != "admin" && principal != nil && principal.User != nil {
 		slot := randomUpper(12)
+		if resumeEventID != "" {
+			slot = resumeEventID
+		}
 		if !s.userAcquire(ctx, principal.User, slot) {
-			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, ErrUserConcurrencyFull.Error())
+			if resumeEventID == "" {
+				s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, ErrUserConcurrencyFull.Error())
+			}
 			return nil, ErrUserConcurrencyFull
 		}
 		defer s.userRelease(ctx, principal.User.ID, slot)
 	}
 
-	modelItem, resolution, aspectRatio, price, err := s.prepareImage(ctx, principal, in, charge)
+	var modelItem *model.ModelConfig
+	var resolution, aspectRatio string
+	var price float64
+	var err error
+	if resumeEvent != nil {
+		modelItem, err = s.models.Get(ctx, resumeEvent.Model)
+		resolution = resumeEvent.Resolution
+		aspectRatio = resumeEvent.Ratio
+		price = resumeEvent.Cost
+	} else {
+		modelItem, resolution, aspectRatio, price, err = s.prepareImage(ctx, principal, in, charge)
+	}
 	if err != nil {
-		s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, err.Error())
+		if resumeEvent == nil {
+			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, err.Error())
+		}
 		return nil, err
 	}
 	refCount := len(in.ReferenceImages)
+	if resumeEvent != nil {
+		refCount = resumeEvent.Refs
+	}
 	// API-key (source "v1") requests don't persist the output: we return the image
 	// as base64 inline (OpenAI gpt-image-1 also returns only b64_json) and never
 	// upload to RustFS, so there's no URL. The event is still logged (empty file)
@@ -527,15 +577,16 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	// ({base}/v1/images/{eventID}/content) that re-fetches with the account token.
 	var upstreamURL string
 	var gatedURL bool
-	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, in.CallMethod, in.RequestPort, nil, in.DeAI)
-	if err != nil {
-		return nil, err
+	eventID := resumeEventID
+	if eventID == "" {
+		eventID, err = s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, in.CallMethod, in.RequestPort, nil, in.DeAI)
+		if err != nil {
+			return nil, err
+		}
+		// Keep the first reference image as a private log preview before contacting
+		// the provider. If generation fails, operators can inspect the exact input.
+		s.storeReferencePreview(ctx, principal, eventID, in.ReferenceImages)
 	}
-	// Keep the first reference image as a private log preview before contacting
-	// the provider. If generation fails, this lets the operator inspect the
-	// exact input that triggered the failure. A successful API request replaces
-	// it with the generated output below; stored UI requests use EventLog.File.
-	s.storeReferencePreview(ctx, principal, eventID, in.ReferenceImages)
 	// Register so the maintenance sweep can cancel this generation if it abandons
 	// the row; deregister on return.
 	s.inflight.Add(eventID, cancel)
@@ -853,26 +904,55 @@ func previewReferenceImage(inputs []string) ([]byte, []byte) {
 	return nil, nil
 }
 
-// StartAsyncImageRequest creates an image event using the same validation,
-// charging, and execution path as POST /v1/images/generations. It waits only
-// until the durable event exists, then leaves generation running in the
-// background and returns the reference-compatible task response.
+// StartAsyncImageRequest validates, charges, and creates the event before
+// durably enqueueing it. Generation is owned by the Redis worker pool, so a web
+// process restart cannot discard accepted work.
 func (s *V1Service) StartAsyncImageRequest(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
-	started := make(chan string, 1)
-	finished := make(chan error, 1)
-	go func() {
-		_, err := s.prepareImageExecutionWithStart(ctx, principal, in, "v1_async", true, func(eventID string) {
-			started <- eventID
-		})
-		finished <- err
-	}()
-
-	select {
-	case eventID := <-started:
-		return map[string]any{"data": map[string]any{"task_id": eventID}}, nil
-	case err := <-finished:
+	if s.asyncImages == nil {
+		return nil, errors.New("async image queue is not configured")
+	}
+	ctx = context.WithoutCancel(ctx)
+	if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
+		s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, "v1_async", in.CallMethod, in.RequestPort, err.Error())
 		return nil, err
 	}
+	if in.DeAI && !s.deaiEnabled(ctx) {
+		in.DeAI = false
+	}
+	modelItem, resolution, aspectRatio, price, err := s.prepareImage(ctx, principal, in, true)
+	if err != nil {
+		s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, "v1_async", in.CallMethod, in.RequestPort, err.Error())
+		return nil, err
+	}
+	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", len(in.ReferenceImages), price, "", "v1_async", in.CallMethod, in.RequestPort, nil, in.DeAI)
+	if err != nil {
+		if principal != nil && principal.User != nil && price > 0 {
+			principal.User, _ = s.users.RefundCredits(ctx, principal.User.ID, price)
+		}
+		return nil, err
+	}
+	s.storeReferencePreview(ctx, principal, eventID, in.ReferenceImages)
+	job := AsyncImageJob{
+		Version:   1,
+		EventID:   eventID,
+		TokenType: "",
+		Request:   in,
+	}
+	if principal != nil {
+		job.TokenType = principal.TokenType
+		if principal.User != nil {
+			job.UserID = principal.User.ID
+		}
+	}
+	if err := s.asyncImages.Enqueue(ctx, job); err != nil {
+		_ = s.refundIfNeeded(ctx, principal, eventID, price)
+		_ = s.events.UpdateStatus(ctx, eventID, "failed", "enqueue async image: "+err.Error(), 0)
+		return nil, err
+	}
+	if err := s.events.MarkQueuedIfUnstarted(ctx, eventID); err != nil {
+		log.Printf("async image event queue-state update failed: event=%s err=%v", eventID, err)
+	}
+	return map[string]any{"data": map[string]any{"task_id": eventID}}, nil
 }
 
 // StartSessionImageJob creates a stored image job for the drawing board and

@@ -14,8 +14,8 @@ import (
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/chatgpt"
-	"backend/internal/provider/custom"
 	"backend/internal/provider/creativefabrica"
+	"backend/internal/provider/custom"
 	"backend/internal/provider/grok"
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
@@ -133,6 +133,7 @@ func NewApp(ctx context.Context) (*App, error) {
 	customClient := custom.NewClient()
 	cfClient := creativefabrica.NewClient("")
 	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, customClient, cfClient, rustfsClient)
+	asyncImageQueue := v1Svc.EnableAsyncImageQueue(rdb, cfg.AsyncImageWorkers)
 	siteSvc := service.NewSiteService(siteRepo, cfg.AppTitle)
 	showcaseSvc := service.NewShowcaseService(showcaseRepo)
 	adminReadSvc := service.NewAdminReadService(cfg, userRepo, modelRepo, eventRepo, siteRepo, tokenRepo, cdkRepo, rustfsClient, showcaseRepo)
@@ -174,6 +175,10 @@ func NewApp(ctx context.Context) (*App, error) {
 	// cleanup, log retention) — the Go equivalent of the Python daemon thread.
 	maintenanceSvc := service.NewMaintenanceService(tokenRepo, tokenSvc, eventRepo, userRepo, refreshSvc, siteRepo, rustfsClient, v1Svc.Inflight(), showcaseRepo, orderRepo)
 	loopCtx, loopCancel := context.WithCancel(context.Background())
+	if err := asyncImageQueue.Start(loopCtx); err != nil {
+		loopCancel()
+		return nil, fmt.Errorf("start async image queue: %w", err)
+	}
 	go maintenanceSvc.Run(loopCtx)
 
 	return &App{

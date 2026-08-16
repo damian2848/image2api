@@ -74,6 +74,7 @@ services:
       REDIS_ADDR: redis:6379
       REDIS_PASSWORD: ""
       REDIS_DB: "0"
+      ASYNC_IMAGE_WORKERS: ${ASYNC_IMAGE_WORKERS:-32}
       RUSTFS_ENDPOINT: http://rustfs:9000
       RUSTFS_BUCKET: vivid-ai
       RUSTFS_ACCESS_KEY: vividai

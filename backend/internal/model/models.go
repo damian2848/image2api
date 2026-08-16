@@ -84,10 +84,14 @@ type ShowcaseItem struct {
 }
 
 type EventLog struct {
-	ID         string         `gorm:"primaryKey;size:32"`
-	TS         time.Time      `gorm:"index;not null"`
-	Kind       string         `gorm:"size:32;index;not null"`
-	Status     string         `gorm:"size:32;index;not null"`
+	ID     string    `gorm:"primaryKey;size:32"`
+	TS     time.Time `gorm:"index;not null"`
+	Kind   string    `gorm:"size:32;index;not null"`
+	Status string    `gorm:"size:32;index;not null"`
+	// QueueState is set only for persistent async image jobs: queued while the
+	// Redis stream owns the task, processing while a worker owns it, and empty
+	// after a terminal transition. It keeps queued work out of stale-job cleanup.
+	QueueState string         `gorm:"size:32;index"`
 	Model      string         `gorm:"size:255;index"`
 	Provider   string         `gorm:"size:100;index"`
 	Prompt     string         `gorm:"type:text"`

@@ -470,7 +470,7 @@ func (h *V1Handler) writeV1Error(c *gin.Context, err error, payload map[string]a
 		c.JSON(http.StatusUnauthorized, gin.H{"detail": err.Error()})
 	case errors.Is(err, service.ErrProviderTemporary):
 		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": err.Error()})
-	case errors.Is(err, service.ErrConcurrencyFull), errors.Is(err, service.ErrUserConcurrencyFull):
+	case errors.Is(err, service.ErrConcurrencyFull), errors.Is(err, service.ErrUserConcurrencyFull), errors.Is(err, service.ErrAsyncImageQueueFull):
 		c.JSON(http.StatusTooManyRequests, gin.H{"detail": err.Error()})
 	case errors.Is(err, service.ErrVideoJobNotFound), errors.Is(err, service.ErrImageJobNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})

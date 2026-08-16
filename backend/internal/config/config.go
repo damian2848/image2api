@@ -28,6 +28,7 @@ type Config struct {
 	RustFSSecretKey   string
 	UpdaterURL        string
 	UpdaterToken      string
+	AsyncImageWorkers int
 }
 
 func Load() (*Config, error) {
@@ -58,12 +59,19 @@ func Load() (*Config, error) {
 			// images both live here and are served (cookie-authed) via /images.
 			filepath.Join(wd, "data", "generated"),
 		)),
-		RustFSEndpoint:  envString("RUSTFS_ENDPOINT", ""),
-		RustFSBucket:    envString("RUSTFS_BUCKET", ""),
-		RustFSAccessKey: envString("RUSTFS_ACCESS_KEY", ""),
-		RustFSSecretKey: envString("RUSTFS_SECRET_KEY", ""),
-		UpdaterURL:      envString("UPDATER_URL", ""),
-		UpdaterToken:    envString("UPDATER_TOKEN", ""),
+		RustFSEndpoint:    envString("RUSTFS_ENDPOINT", ""),
+		RustFSBucket:      envString("RUSTFS_BUCKET", ""),
+		RustFSAccessKey:   envString("RUSTFS_ACCESS_KEY", ""),
+		RustFSSecretKey:   envString("RUSTFS_SECRET_KEY", ""),
+		UpdaterURL:        envString("UPDATER_URL", ""),
+		UpdaterToken:      envString("UPDATER_TOKEN", ""),
+		AsyncImageWorkers: envInt("ASYNC_IMAGE_WORKERS", 32),
+	}
+	if cfg.AsyncImageWorkers < 1 {
+		cfg.AsyncImageWorkers = 1
+	}
+	if cfg.AsyncImageWorkers > 128 {
+		cfg.AsyncImageWorkers = 128
 	}
 
 	return cfg, nil
