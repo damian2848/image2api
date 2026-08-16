@@ -56,4 +56,4 @@ Release 创建完成后，以管理员登录，打开“在线更新”，检查
 2. 获取 GitHub Latest Release 对应的 tag，并切换到该不可变版本。
 3. 仅重建并重启 `backend`、`web` 容器。
 
-PostgreSQL、Redis、RustFS 与生成文件卷不会被删除或重建。若镜像构建失败，更新器会恢复仓库源码到开始更新前的提交，现有容器继续运行。可用 `sudo journalctl -u image2api-updater -f` 查看宿主机更新日志。
+PostgreSQL、Redis、RustFS 与生成文件卷不会被删除或重建。若构建或重建失败，更新器会恢复仓库源码，并重新应用开始更新前的 `backend` 与 `web` 容器配置。可用 `sudo journalctl -u image2api-updater -f` 查看宿主机更新日志。

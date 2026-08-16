@@ -334,8 +334,10 @@ func (s *server) apply(rel *release) {
 
 	s.setStep("rebuilding_containers")
 	if err := s.compose(ctx); err != nil {
-		// Containers keep serving the former image when Compose fails. Put the
-		// source tree back too, so the next manual diagnosis starts clean.
+		// Compose may have already recreated one service before a later service
+		// fails (for example, a host-port collision). Restore both the source and
+		// the previous container definitions so a partial update cannot leave the
+		// application unavailable behind a healthy reverse proxy.
 		restoreTarget := strings.TrimSpace(oldRef)
 		restoreArgs := []string{"checkout"}
 		if restoreTarget == "" {
@@ -347,7 +349,12 @@ func (s *server) apply(rel *release) {
 			s.fail(fmt.Errorf("rebuild failed: %v; source restore also failed: %v", err, restoreErr))
 			return
 		}
-		s.fail(fmt.Errorf("rebuild failed; source restored to %s: %w", restoreTarget, err))
+		s.setStep("restoring_containers")
+		if restoreErr := s.compose(ctx); restoreErr != nil {
+			s.fail(fmt.Errorf("rebuild failed: %v; source restored to %s but container restore failed: %v", err, restoreTarget, restoreErr))
+			return
+		}
+		s.fail(fmt.Errorf("rebuild failed; source and containers restored to %s: %w", restoreTarget, err))
 		return
 	}
 
