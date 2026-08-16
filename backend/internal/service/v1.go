@@ -1847,34 +1847,40 @@ const videoGenBudget = 30 * time.Minute
 const grokConcurrencyPerAccount = 10
 
 const (
-	// Adobe submit admission is independent per upstream endpoint. Each bucket
-	// starts conservatively, grows additively after accepted submits, and halves
-	// on overload. Accepted jobs continue polling at full account concurrency.
-	adobeSubmitInitialConcurrency   = 4
-	adobeSubmitMinConcurrency       = 1
-	adobeSubmitMaxConcurrency       = 16
-	adobeSubmitMinLease             = time.Second
-	adobeSubmitAcquirePoll          = 100 * time.Millisecond
-	adobeSubmitSuccessesPerIncrease = 20
-	adobeSubmitAdaptiveTTL          = time.Hour
+	// The render gate is held for the complete Adobe job lifecycle (submit + poll
+	// + download), not merely for the initial HTTP submit. This is the real
+	// capacity control: a burst waits locally instead of filling Adobe's render
+	// queue and learning about overload a minute later.
+	adobeRenderInitialConcurrency   = 4
+	adobeRenderMinConcurrency       = 1
+	adobeRenderMaxConcurrency       = 32
+	adobeRenderSuccessesPerIncrease = 8
+	adobeRenderAcquirePoll          = 200 * time.Millisecond
+	adobeRenderAdaptiveTTL          = time.Hour
+
+	// A short static submit gate still smooths starts after render capacity grows.
+	adobeSubmitBurstConcurrency = 4
+	adobeSubmitMinLease         = time.Second
+	adobeSubmitAcquirePoll      = 100 * time.Millisecond
 
 	adobeOverloadRetries       = 2
-	adobeOverloadRetryBase     = 2 * time.Second
-	adobeOverloadWindow        = 10 * time.Second
+	adobeOverloadRetryBase     = 10 * time.Second
+	adobeOverloadWindow        = 2 * time.Minute
 	adobeOverloadTripThreshold = 3
-	adobeOverloadBasePause     = 5 * time.Second
-	adobeOverloadMaxPause      = 20 * time.Second
+	adobeOverloadBasePause     = 15 * time.Second
+	adobeOverloadMaxPause      = time.Minute
 
+	adobeRenderSlotsKeyPrefix    = "conc:p:adobe:render:"
+	adobeRenderLimitKeyPrefix    = "limit:p:adobe:render:"
+	adobeRenderSuccessKeyPrefix  = "success:p:adobe:render:"
+	adobeRenderOverloadKeyPrefix = "overload:p:adobe:render:"
+	adobeRenderCooldownKeyPrefix = "pause:p:adobe:render:"
 	adobeSubmitSlotsKeyPrefix    = "conc:p:adobe:submit:"
-	adobeSubmitLimitKeyPrefix    = "limit:p:adobe:submit:"
-	adobeSubmitSuccessKeyPrefix  = "success:p:adobe:submit:"
-	adobeSubmitOverloadKeyPrefix = "overload:p:adobe:submit:"
-	adobeSubmitCooldownKeyPrefix = "pause:p:adobe:submit:"
 )
 
 // maxTempDeadAccounts caps how many accounts an account/network-specific
-// temporary error may burn before giving up. Adobe's explicit submit-overload
-// response bypasses this path and uses endpoint pacing/cooldown instead.
+// temporary error may burn before giving up. Adobe capacity errors bypass this
+// path because switching accounts would only create more upstream jobs.
 const maxTempDeadAccounts = 10
 
 // poolRetryRounds is the total number of account-pool passes for transient
@@ -1895,7 +1901,7 @@ const poolRetryDelay = 500 * time.Millisecond
 //     chatgpt's JWT IS the credential), mark the account and fail over.
 //   - 上游临时 temporary → record the failure (no disable/dead) and FAIL OVER to
 //     the next account immediately, capped at maxTempDeadAccounts accounts. An
-//     explicit endpoint submit overload is handled before classification,
+//     explicit endpoint submit/job overload is handled before classification,
 //     without account penalty or failover. If every account in the pass is
 //     temporary/busy, make one delayed pool pass.
 //   - 参数错 / request-level (anything else) → return immediately, no retry, no
@@ -2029,10 +2035,10 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			})
 			return data, nil, false, false
 		}
-		// Adobe explicitly rejected the submit before creating a job. This is a
-		// endpoint pressure signal, not an account fault: do not increment the
-		// token's failure counters or fan the request out across more accounts.
-		if errors.Is(err, adobe.ErrSubmitOverloaded) {
+		// Adobe capacity errors are endpoint pressure, not account faults. A job
+		// overload is especially important: Adobe already accepted one render, so
+		// failing over would create duplicates and amplify the overloaded queue.
+		if isAdobeCapacityOverload(err) {
 			return nil, err, false, false
 		}
 		isAuth, isQuota, isTemp, isDead := classify(err)
@@ -2090,6 +2096,10 @@ func adobeErrClass(e error) (bool, bool, bool, bool) {
 	return errors.Is(e, adobe.ErrAuth), errors.Is(e, adobe.ErrQuotaExhausted), errors.Is(e, adobe.ErrTemporaryUpstream) || errors.Is(e, adobe.ErrRateLimited), errors.Is(e, adobe.ErrDeadUpstream)
 }
 
+func isAdobeCapacityOverload(err error) bool {
+	return errors.Is(err, adobe.ErrSubmitOverloaded) || errors.Is(err, adobe.ErrJobOverloaded)
+}
+
 const (
 	adobeSubmitBucket3P      = "3p-images"
 	adobeSubmitBucketImageV5 = "image-v5"
@@ -2121,33 +2131,31 @@ func adobeOverloadPause(overloads int) time.Duration {
 	return pause
 }
 
-type adobeSubmitLease struct {
-	finish func(error)
-	cancel func()
+type adobeRenderLease struct {
+	finish func(success bool)
 }
 
-func (s *V1Service) acquireAdobeSubmitLease(ctx context.Context, eventID, bucket string) (*adobeSubmitLease, error) {
-	slotsKey := adobeSubmitKey(adobeSubmitSlotsKeyPrefix, bucket)
-	limitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, bucket)
-	successKey := adobeSubmitKey(adobeSubmitSuccessKeyPrefix, bucket)
-	overloadKey := adobeSubmitKey(adobeSubmitOverloadKeyPrefix, bucket)
-	cooldownKey := adobeSubmitKey(adobeSubmitCooldownKeyPrefix, bucket)
+type adobeRenderPermit func(ctx context.Context) (*adobeRenderLease, error)
+
+func (s *V1Service) acquireAdobeRenderLease(ctx context.Context, eventID, bucket string) (*adobeRenderLease, error) {
+	slotsKey := adobeSubmitKey(adobeRenderSlotsKeyPrefix, bucket)
+	limitKey := adobeSubmitKey(adobeRenderLimitKeyPrefix, bucket)
+	successKey := adobeSubmitKey(adobeRenderSuccessKeyPrefix, bucket)
+	cooldownKey := adobeSubmitKey(adobeRenderCooldownKeyPrefix, bucket)
 
 	var limit int
-	slotToken := eventID + "-submit-" + randomUpper(8)
+	slotToken := eventID + "-render"
 	for {
 		if err := s.conc.WaitWhilePaused(ctx, cooldownKey); err != nil {
 			return nil, err
 		}
 		var err error
-		limit, err = s.conc.AcquireWaitDynamic(ctx, slotsKey, slotToken, adobeSubmitAcquirePoll, func() int {
-			return s.conc.AdaptiveLimit(ctx, limitKey, adobeSubmitInitialConcurrency, adobeSubmitMinConcurrency, adobeSubmitMaxConcurrency, adobeSubmitAdaptiveTTL)
+		limit, err = s.conc.AcquireWaitDynamic(ctx, slotsKey, slotToken, adobeRenderAcquirePoll, func() int {
+			return s.conc.AdaptiveLimit(ctx, limitKey, adobeRenderInitialConcurrency, adobeRenderMinConcurrency, adobeRenderMaxConcurrency, adobeRenderAdaptiveTTL)
 		})
 		if err != nil {
 			return nil, err
 		}
-		// If a circuit opened while this task was waiting, release and rejoin after
-		// the cooldown so the reduced adaptive limit applies to every queued worker.
 		if s.conc.PauseRemaining(ctx, cooldownKey) > 0 {
 			s.conc.Release(context.WithoutCancel(ctx), slotsKey, slotToken)
 			continue
@@ -2155,45 +2163,92 @@ func (s *V1Service) acquireAdobeSubmitLease(ctx context.Context, eventID, bucket
 		break
 	}
 
+	var once sync.Once
+	return &adobeRenderLease{finish: func(success bool) {
+		once.Do(func() {
+			bookkeepingCtx := context.WithoutCancel(ctx)
+			if success {
+				newLimit := s.conc.RecordAdaptiveSuccess(bookkeepingCtx, limitKey, successKey,
+					adobeRenderInitialConcurrency, adobeRenderMinConcurrency, adobeRenderMaxConcurrency,
+					adobeRenderSuccessesPerIncrease, adobeRenderAdaptiveTTL)
+				if newLimit > limit {
+					log.Printf("adobe render capacity recovered: bucket=%s limit=%d", bucket, newLimit)
+				}
+			}
+			s.conc.Release(bookkeepingCtx, slotsKey, slotToken)
+		})
+	}}, nil
+}
+
+// primedAdobeRenderPermit queues the request before account selection. The
+// first upstream attempt consumes the primed lease; every overload retry must
+// acquire a fresh lease and therefore obey the newly reduced adaptive limit.
+func (s *V1Service) primedAdobeRenderPermit(ctx context.Context, eventID, bucket string) (adobeRenderPermit, func(), error) {
+	lease, err := s.acquireAdobeRenderLease(ctx, eventID, bucket)
+	if err != nil {
+		return nil, nil, err
+	}
+	var mu sync.Mutex
+	primed := lease
+	permit := func(acquireCtx context.Context) (*adobeRenderLease, error) {
+		mu.Lock()
+		if primed != nil {
+			current := primed
+			primed = nil
+			mu.Unlock()
+			return current, nil
+		}
+		mu.Unlock()
+		return s.acquireAdobeRenderLease(acquireCtx, eventID, bucket)
+	}
+	cancelUnused := func() {
+		mu.Lock()
+		current := primed
+		primed = nil
+		mu.Unlock()
+		if current != nil {
+			current.finish(false)
+		}
+	}
+	return permit, cancelUnused, nil
+}
+
+func (s *V1Service) recordAdobeCapacityOverload(ctx context.Context, bucket, phase string) {
+	bookkeepingCtx := context.WithoutCancel(ctx)
+	limitKey := adobeSubmitKey(adobeRenderLimitKeyPrefix, bucket)
+	successKey := adobeSubmitKey(adobeRenderSuccessKeyPrefix, bucket)
+	overloadKey := adobeSubmitKey(adobeRenderOverloadKeyPrefix, bucket)
+	cooldownKey := adobeSubmitKey(adobeRenderCooldownKeyPrefix, bucket)
+	newLimit, overloads := s.conc.RecordAdaptiveOverload(bookkeepingCtx, limitKey, successKey, overloadKey,
+		adobeRenderInitialConcurrency, adobeRenderMinConcurrency, adobeRenderMaxConcurrency,
+		adobeOverloadWindow, adobeRenderAdaptiveTTL)
+	pause := adobeOverloadPause(overloads)
+	if pause > 0 {
+		s.conc.Pause(bookkeepingCtx, cooldownKey, pause)
+	}
+	log.Printf("adobe capacity overloaded: bucket=%s phase=%s window_count=%d limit=%d pause=%s", bucket, phase, overloads, newLimit, pause)
+}
+
+type adobeSubmitLease struct {
+	finish func(error)
+}
+
+func (s *V1Service) acquireAdobeSubmitLease(ctx context.Context, eventID, bucket string) (*adobeSubmitLease, error) {
+	slotsKey := adobeSubmitKey(adobeSubmitSlotsKeyPrefix, bucket)
+	slotToken := eventID + "-submit-" + randomUpper(8)
+	if err := s.conc.AcquireWait(ctx, slotsKey, adobeSubmitBurstConcurrency, slotToken, adobeSubmitAcquirePoll); err != nil {
+		return nil, err
+	}
 	acquiredAt := time.Now()
 	var once sync.Once
-	releaseSlot := func(enforceLease bool) {
-		if enforceLease {
+	return &adobeSubmitLease{finish: func(error) {
+		once.Do(func() {
 			if remaining := adobeSubmitMinLease - time.Since(acquiredAt); remaining > 0 {
 				time.Sleep(remaining)
 			}
-		}
-		s.conc.Release(context.WithoutCancel(ctx), slotsKey, slotToken)
-	}
-	lease := &adobeSubmitLease{}
-	lease.finish = func(submitErr error) {
-		once.Do(func() {
-			bookkeepingCtx := context.WithoutCancel(ctx)
-			switch {
-			case submitErr == nil:
-				newLimit := s.conc.RecordAdaptiveSuccess(bookkeepingCtx, limitKey, successKey,
-					adobeSubmitInitialConcurrency, adobeSubmitMinConcurrency, adobeSubmitMaxConcurrency,
-					adobeSubmitSuccessesPerIncrease, adobeSubmitAdaptiveTTL)
-				if newLimit > limit {
-					log.Printf("adobe submit admission recovered: bucket=%s limit=%d", bucket, newLimit)
-				}
-			case errors.Is(submitErr, adobe.ErrSubmitOverloaded):
-				newLimit, overloads := s.conc.RecordAdaptiveOverload(bookkeepingCtx, limitKey, successKey, overloadKey,
-					adobeSubmitInitialConcurrency, adobeSubmitMinConcurrency, adobeSubmitMaxConcurrency,
-					adobeOverloadWindow, adobeSubmitAdaptiveTTL)
-				pause := adobeOverloadPause(overloads)
-				if pause > 0 {
-					s.conc.Pause(bookkeepingCtx, cooldownKey, pause)
-				}
-				log.Printf("adobe submit overloaded: bucket=%s window_count=%d limit=%d pause=%s", bucket, overloads, newLimit, pause)
-			}
-			releaseSlot(true)
+			s.conc.Release(context.WithoutCancel(ctx), slotsKey, slotToken)
 		})
-	}
-	lease.cancel = func() {
-		once.Do(func() { releaseSlot(false) })
-	}
-	return lease, nil
+	}}, nil
 }
 
 func (s *V1Service) adobeSubmitPermit(eventID, bucket string) adobe.SubmitPermit {
@@ -2204,44 +2259,6 @@ func (s *V1Service) adobeSubmitPermit(eventID, bucket string) adobe.SubmitPermit
 		}
 		return lease.finish, nil
 	}
-}
-
-// primedAdobeSubmitPermit acquires the first submit lease before account
-// selection. Text-to-image bursts therefore queue at the endpoint gate without
-// reserving one Adobe account per waiting goroutine. Failovers and retries
-// acquire subsequent leases normally.
-func (s *V1Service) primedAdobeSubmitPermit(ctx context.Context, eventID, bucket string) (adobe.SubmitPermit, func(), error) {
-	lease, err := s.acquireAdobeSubmitLease(ctx, eventID, bucket)
-	if err != nil {
-		return nil, nil, err
-	}
-	var mu sync.Mutex
-	primed := lease
-	permit := func(acquireCtx context.Context) (func(error), error) {
-		mu.Lock()
-		if primed != nil {
-			current := primed
-			primed = nil
-			mu.Unlock()
-			return current.finish, nil
-		}
-		mu.Unlock()
-		next, acquireErr := s.acquireAdobeSubmitLease(acquireCtx, eventID, bucket)
-		if acquireErr != nil {
-			return nil, acquireErr
-		}
-		return next.finish, nil
-	}
-	cancelUnused := func() {
-		mu.Lock()
-		current := primed
-		primed = nil
-		mu.Unlock()
-		if current != nil {
-			current.cancel()
-		}
-	}
-	return permit, cancelUnused, nil
 }
 
 func waitForAdobeRetry(ctx context.Context, duration time.Duration) error {
@@ -2267,17 +2284,36 @@ func adobeOverloadJitter(eventID string, attempt int) time.Duration {
 	return time.Duration(hash%5000) * time.Millisecond
 }
 
-func (s *V1Service) generateAdobeImageWithOverloadRetry(ctx context.Context, eventID string, token model.TokenAccount, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, blobIDs []string, downloadResult bool, permit adobe.SubmitPermit) ([]byte, map[string]any, error) {
+func (s *V1Service) generateAdobeImageWithOverloadRetry(ctx context.Context, eventID string, token model.TokenAccount, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, blobIDs []string, downloadResult bool, submitPermit adobe.SubmitPermit, renderPermit adobeRenderPermit) ([]byte, map[string]any, error) {
+	bucket := adobeSubmitBucket(modelItem.ID)
 	for attempt := 0; ; attempt++ {
+		renderLease, acquireErr := renderPermit(ctx)
+		if acquireErr != nil {
+			return nil, nil, acquireErr
+		}
 		data, meta, err := s.adobe.GenerateImageWithSubmitPermit(
 			ctx, token.Value, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, downloadResult,
-			permit,
+			submitPermit,
 		)
-		if !errors.Is(err, adobe.ErrSubmitOverloaded) || attempt >= adobeOverloadRetries {
+		if !isAdobeCapacityOverload(err) {
+			renderLease.finish(err == nil)
+			return data, meta, err
+		}
+		phase := "submit"
+		if errors.Is(err, adobe.ErrJobOverloaded) {
+			phase = "render"
+		}
+		s.recordAdobeCapacityOverload(ctx, bucket, phase)
+		renderLease.finish(false)
+		if attempt >= adobeOverloadRetries {
 			return data, meta, err
 		}
 		delay := adobeOverloadRetryBase*time.Duration(1<<attempt) + adobeOverloadJitter(eventID, attempt)
 		if waitErr := waitForAdobeRetry(ctx, delay); waitErr != nil {
+			return nil, nil, waitErr
+		}
+		cooldownKey := adobeSubmitKey(adobeRenderCooldownKeyPrefix, bucket)
+		if waitErr := s.conc.WaitWhilePaused(ctx, cooldownKey); waitErr != nil {
 			return nil, nil, waitErr
 		}
 	}
@@ -2340,23 +2376,17 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 		return nil, "", err
 	}
 	bucket := adobeSubmitBucket(modelItem.ID)
-	permit := s.adobeSubmitPermit(eventID, bucket)
-	// The common text-to-image path can wait at the endpoint gate before taking
-	// an account slot. Reference uploads need the selected account first, so they
-	// keep the regular just-in-time permit path.
-	if len(refs) == 0 {
-		primedPermit, cancelUnused, primeErr := s.primedAdobeSubmitPermit(ctx, eventID, bucket)
-		if primeErr != nil {
-			return nil, "", primeErr
-		}
-		permit = primedPermit
-		defer cancelUnused()
+	renderPermit, cancelUnusedRender, err := s.primedAdobeRenderPermit(ctx, eventID, bucket)
+	if err != nil {
+		return nil, "", err
 	}
+	defer cancelUnusedRender()
+	submitPermit := s.adobeSubmitPermit(eventID, bucket)
 
-	// Round-robin order. Auth/quota and account-specific temporary errors still
-	// fail over. Adobe submit overload is handled separately by endpoint bucket:
-	// adaptive pacing + delayed same-account retries prevent one request from
-	// sweeping the pool and multiplying pressure.
+	// Round-robin order. The endpoint render lease was acquired before any account
+	// slot, so burst waiters do not reserve accounts. Auth/quota and genuinely
+	// account-specific failures still fail over; capacity errors retry this account
+	// only and never fan out across the pool.
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "adobe", active, "image", func(token model.TokenAccount) ([]byte, error) {
 		var blobIDs []string
@@ -2374,7 +2404,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 			}
 			blobIDs = append(blobIDs, id)
 		}
-		d, meta, genErr := s.generateAdobeImageWithOverloadRetry(ctx, eventID, token, modelItem, in, aspectRatio, resolution, blobIDs, !urlOnly, permit)
+		d, meta, genErr := s.generateAdobeImageWithOverloadRetry(ctx, eventID, token, modelItem, in, aspectRatio, resolution, blobIDs, !urlOnly, submitPermit, renderPermit)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
 		}

@@ -33,6 +33,9 @@ func TestSubmitOverloadedWrapsTemporaryUpstream(t *testing.T) {
 	if !errors.Is(ErrSubmitOverloaded, ErrTemporaryUpstream) {
 		t.Fatal("submit overload must remain a temporary upstream error")
 	}
+	if !errors.Is(ErrJobOverloaded, ErrTemporaryUpstream) {
+		t.Fatal("job overload must remain a temporary upstream error")
+	}
 }
 
 func TestSubmitPermitReceivesAdobeSubmitResult(t *testing.T) {
@@ -57,6 +60,27 @@ func TestSubmitPermitReceivesAdobeSubmitResult(t *testing.T) {
 	}
 	if !errors.Is(reported, ErrSubmitOverloaded) {
 		t.Fatalf("reported error = %v, want ErrSubmitOverloaded", reported)
+	}
+}
+
+func TestPollOverloadIsClassifiedAsJobCapacity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"error_code":"timeout_error","message":"system under load"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient("test-key", "")
+	session, err := client.newDirectTLSClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = client.pollImage(context.Background(), session, "token", server.URL, false)
+	if !errors.Is(err, ErrJobOverloaded) {
+		t.Fatalf("poll error = %v, want ErrJobOverloaded", err)
+	}
+	if !errors.Is(err, ErrTemporaryUpstream) {
+		t.Fatalf("poll error = %v, want temporary classification", err)
 	}
 }
 

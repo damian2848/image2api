@@ -11,28 +11,32 @@ import (
 	"backend/internal/provider/adobe"
 )
 
-func TestTryAccountSubmitOverloadDoesNotFanOutOrPenalizeAccount(t *testing.T) {
-	token := model.TokenAccount{ID: "adobe-1", Pool: "adobe", Status: "active", Fails: 3, FailTotal: 7}
-	service := &V1Service{}
-	attempts := 0
-	_, gotErr, failover, temporaryAccountFailure := service.tryAccount(
-		context.Background(), "evt-overload", token.Pool, token, "image",
-		func(model.TokenAccount) ([]byte, error) {
-			attempts++
-			return nil, fmt.Errorf("upstream response: %w", adobe.ErrSubmitOverloaded)
-		},
-		adobeErrClass,
-		nil,
-		true,
-	)
-	if !errors.Is(gotErr, adobe.ErrSubmitOverloaded) {
-		t.Fatalf("error = %v, want ErrSubmitOverloaded", gotErr)
-	}
-	if attempts != 1 {
-		t.Fatalf("attempts = %d, want 1", attempts)
-	}
-	if failover || temporaryAccountFailure {
-		t.Fatalf("submit overload must not fail over or penalize the account")
+func TestTryAccountAdobeCapacityOverloadDoesNotFanOutOrPenalizeAccount(t *testing.T) {
+	for _, overloadErr := range []error{adobe.ErrSubmitOverloaded, adobe.ErrJobOverloaded} {
+		t.Run(overloadErr.Error(), func(t *testing.T) {
+			token := model.TokenAccount{ID: "adobe-1", Pool: "adobe", Status: "active", Fails: 3, FailTotal: 7}
+			service := &V1Service{}
+			attempts := 0
+			_, gotErr, failover, temporaryAccountFailure := service.tryAccount(
+				context.Background(), "evt-overload", token.Pool, token, "image",
+				func(model.TokenAccount) ([]byte, error) {
+					attempts++
+					return nil, fmt.Errorf("upstream response: %w", overloadErr)
+				},
+				adobeErrClass,
+				nil,
+				true,
+			)
+			if !errors.Is(gotErr, overloadErr) {
+				t.Fatalf("error = %v, want %v", gotErr, overloadErr)
+			}
+			if attempts != 1 {
+				t.Fatalf("attempts = %d, want 1", attempts)
+			}
+			if failover || temporaryAccountFailure {
+				t.Fatalf("capacity overload must not fail over or penalize the account")
+			}
+		})
 	}
 }
 
@@ -62,10 +66,10 @@ func TestAdobeOverloadPauseRequiresCorrelatedFailures(t *testing.T) {
 	}{
 		{count: 1, want: 0},
 		{count: 2, want: 0},
-		{count: 3, want: 5 * time.Second},
-		{count: 4, want: 10 * time.Second},
-		{count: 5, want: 20 * time.Second},
-		{count: 10, want: 20 * time.Second},
+		{count: 3, want: 15 * time.Second},
+		{count: 4, want: 30 * time.Second},
+		{count: 5, want: time.Minute},
+		{count: 10, want: time.Minute},
 	}
 	for _, test := range tests {
 		if got := adobeOverloadPause(test.count); got != test.want {

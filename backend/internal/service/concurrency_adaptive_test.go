@@ -54,13 +54,13 @@ func TestAdaptiveLimitRecoversAndBacksOff(t *testing.T) {
 	}
 }
 
-func TestAdobeSubmitBucketsAreIndependent(t *testing.T) {
+func TestAdobeRenderBucketsAreIndependent(t *testing.T) {
 	service, _ := testConcurrencyService(t)
 	v1 := &V1Service{conc: service}
 	ctx := context.Background()
 
-	threePLimitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, adobeSubmitBucket3P)
-	imageV5LimitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, adobeSubmitBucketImageV5)
+	threePLimitKey := adobeSubmitKey(adobeRenderLimitKeyPrefix, adobeSubmitBucket3P)
+	imageV5LimitKey := adobeSubmitKey(adobeRenderLimitKeyPrefix, adobeSubmitBucketImageV5)
 	if err := service.redis.Set(ctx, threePLimitKey, 1, time.Hour).Err(); err != nil {
 		t.Fatal(err)
 	}
@@ -68,50 +68,62 @@ func TestAdobeSubmitBucketsAreIndependent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := v1.acquireAdobeSubmitLease(ctx, "evt-first", adobeSubmitBucket3P)
+	first, err := v1.acquireAdobeRenderLease(ctx, "evt-first", adobeSubmitBucket3P)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.cancel()
+	defer first.finish(false)
 
 	timedCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
 	defer cancel()
-	if _, err := v1.acquireAdobeSubmitLease(timedCtx, "evt-blocked", adobeSubmitBucket3P); err == nil {
+	if _, err := v1.acquireAdobeRenderLease(timedCtx, "evt-blocked", adobeSubmitBucket3P); err == nil {
 		t.Fatal("second 3p-images lease should wait for the occupied bucket")
 	}
 
-	imageV5, err := v1.acquireAdobeSubmitLease(ctx, "evt-image-v5", adobeSubmitBucketImageV5)
+	imageV5, err := v1.acquireAdobeRenderLease(ctx, "evt-image-v5", adobeSubmitBucketImageV5)
 	if err != nil {
 		t.Fatalf("image-v5 bucket should remain independent: %v", err)
 	}
-	imageV5.cancel()
+	imageV5.finish(false)
 }
 
-func TestAdobePrimedPermitCancelReleasesUnusedLease(t *testing.T) {
+func TestAdobeRenderLeaseIsHeldUntilJobFinishes(t *testing.T) {
 	service, _ := testConcurrencyService(t)
 	v1 := &V1Service{conc: service}
 	ctx := context.Background()
-	limitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, adobeSubmitBucket3P)
+	limitKey := adobeSubmitKey(adobeRenderLimitKeyPrefix, adobeSubmitBucket3P)
 	if err := service.redis.Set(ctx, limitKey, 1, time.Hour).Err(); err != nil {
 		t.Fatal(err)
 	}
 
-	_, cancelUnused, err := v1.primedAdobeSubmitPermit(ctx, "evt-primed", adobeSubmitBucket3P)
+	first, err := v1.acquireAdobeRenderLease(ctx, "evt-running", adobeSubmitBucket3P)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cancelUnused()
 
-	nextCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer cancel()
-	next, err := v1.acquireAdobeSubmitLease(nextCtx, "evt-next", adobeSubmitBucket3P)
-	if err != nil {
-		t.Fatalf("unused primed lease was not released: %v", err)
+	acquired := make(chan *adobeRenderLease, 1)
+	go func() {
+		next, acquireErr := v1.acquireAdobeRenderLease(ctx, "evt-next", adobeSubmitBucket3P)
+		if acquireErr == nil {
+			acquired <- next
+		}
+	}()
+	select {
+	case next := <-acquired:
+		next.finish(false)
+		t.Fatal("next render entered before the running job completed")
+	case <-time.After(250 * time.Millisecond):
 	}
-	next.cancel()
+	first.finish(false)
+	select {
+	case next := <-acquired:
+		next.finish(false)
+	case <-time.After(time.Second):
+		t.Fatal("next render did not enter after the running job completed")
+	}
 }
 
-func TestAdobeSubmitGateBoundsTwentyRequestBurst(t *testing.T) {
+func TestAdobeRenderGateBoundsTwentyRequestBurst(t *testing.T) {
 	service, _ := testConcurrencyService(t)
 	v1 := &V1Service{conc: service}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -125,7 +137,7 @@ func TestAdobeSubmitGateBoundsTwentyRequestBurst(t *testing.T) {
 		group.Add(1)
 		go func(index int) {
 			defer group.Done()
-			lease, err := v1.acquireAdobeSubmitLease(ctx, fmt.Sprintf("evt-%02d", index), adobeSubmitBucket3P)
+			lease, err := v1.acquireAdobeRenderLease(ctx, fmt.Sprintf("evt-%02d", index), adobeSubmitBucket3P)
 			if err != nil {
 				errors <- err
 				return
@@ -139,7 +151,7 @@ func TestAdobeSubmitGateBoundsTwentyRequestBurst(t *testing.T) {
 			}
 			time.Sleep(10 * time.Millisecond)
 			active.Add(-1)
-			lease.cancel()
+			lease.finish(false)
 		}(i)
 	}
 	group.Wait()
@@ -147,33 +159,33 @@ func TestAdobeSubmitGateBoundsTwentyRequestBurst(t *testing.T) {
 	for err := range errors {
 		t.Fatalf("burst admission failed: %v", err)
 	}
-	if got := maximum.Load(); got > adobeSubmitInitialConcurrency {
-		t.Fatalf("maximum simultaneous leases = %d, want <= %d", got, adobeSubmitInitialConcurrency)
+	if got := maximum.Load(); got > adobeRenderInitialConcurrency {
+		t.Fatalf("maximum simultaneous renders = %d, want <= %d", got, adobeRenderInitialConcurrency)
 	}
 	if got := maximum.Load(); got < 2 {
 		t.Fatalf("burst did not exercise concurrency: maximum = %d", got)
 	}
 }
 
-func TestQueuedAdobeSubmitHonorsReducedLimit(t *testing.T) {
+func TestQueuedAdobeRenderHonorsReducedLimit(t *testing.T) {
 	service, _ := testConcurrencyService(t)
 	v1 := &V1Service{conc: service}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	leases := make([]*adobeSubmitLease, 0, adobeSubmitInitialConcurrency)
-	for i := 0; i < adobeSubmitInitialConcurrency; i++ {
-		lease, err := v1.acquireAdobeSubmitLease(ctx, fmt.Sprintf("evt-held-%d", i), adobeSubmitBucket3P)
+	leases := make([]*adobeRenderLease, 0, adobeRenderInitialConcurrency)
+	for i := 0; i < adobeRenderInitialConcurrency; i++ {
+		lease, err := v1.acquireAdobeRenderLease(ctx, fmt.Sprintf("evt-held-%d", i), adobeSubmitBucket3P)
 		if err != nil {
 			t.Fatal(err)
 		}
 		leases = append(leases, lease)
 	}
 
-	acquired := make(chan *adobeSubmitLease, 1)
+	acquired := make(chan *adobeRenderLease, 1)
 	failed := make(chan error, 1)
 	go func() {
-		lease, err := v1.acquireAdobeSubmitLease(ctx, "evt-queued", adobeSubmitBucket3P)
+		lease, err := v1.acquireAdobeRenderLease(ctx, "evt-queued", adobeSubmitBucket3P)
 		if err != nil {
 			failed <- err
 			return
@@ -181,18 +193,18 @@ func TestQueuedAdobeSubmitHonorsReducedLimit(t *testing.T) {
 		acquired <- lease
 	}()
 
-	limitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, adobeSubmitBucket3P)
-	successKey := adobeSubmitKey(adobeSubmitSuccessKeyPrefix, adobeSubmitBucket3P)
-	overloadKey := adobeSubmitKey(adobeSubmitOverloadKeyPrefix, adobeSubmitBucket3P)
-	service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 16, 10*time.Second, time.Hour)
-	service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 16, 10*time.Second, time.Hour)
+	limitKey := adobeSubmitKey(adobeRenderLimitKeyPrefix, adobeSubmitBucket3P)
+	successKey := adobeSubmitKey(adobeRenderSuccessKeyPrefix, adobeSubmitBucket3P)
+	overloadKey := adobeSubmitKey(adobeRenderOverloadKeyPrefix, adobeSubmitBucket3P)
+	service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 32, adobeOverloadWindow, time.Hour)
+	service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 32, adobeOverloadWindow, time.Hour)
 
 	// Releasing one of four live leases still leaves three active, above the new
 	// limit of one. A queued worker must not enter using the old limit of four.
-	leases[0].cancel()
+	leases[0].finish(false)
 	select {
 	case lease := <-acquired:
-		lease.cancel()
+		lease.finish(false)
 		t.Fatal("queued worker ignored the reduced adaptive limit")
 	case err := <-failed:
 		t.Fatalf("queued worker failed early: %v", err)
@@ -200,14 +212,70 @@ func TestQueuedAdobeSubmitHonorsReducedLimit(t *testing.T) {
 	}
 
 	for _, lease := range leases[1:] {
-		lease.cancel()
+		lease.finish(false)
 	}
 	select {
 	case lease := <-acquired:
-		lease.cancel()
+		lease.finish(false)
 	case err := <-failed:
 		t.Fatalf("queued worker failed after capacity was released: %v", err)
 	case <-time.After(time.Second):
 		t.Fatal("queued worker did not enter at the reduced limit")
 	}
+}
+
+func TestAdobeOverloadRetryRejoinsReducedRenderGate(t *testing.T) {
+	service, _ := testConcurrencyService(t)
+	v1 := &V1Service{conc: service}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	renderPermit, cancelUnused, err := v1.primedAdobeRenderPermit(ctx, "evt-retry", adobeSubmitBucket3P)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancelUnused()
+	firstAttempt, err := renderPermit(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	other := make([]*adobeRenderLease, 0, 3)
+	for i := 0; i < 3; i++ {
+		lease, acquireErr := v1.acquireAdobeRenderLease(ctx, fmt.Sprintf("evt-other-%d", i), adobeSubmitBucket3P)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		other = append(other, lease)
+	}
+
+	limitKey := adobeSubmitKey(adobeRenderLimitKeyPrefix, adobeSubmitBucket3P)
+	successKey := adobeSubmitKey(adobeRenderSuccessKeyPrefix, adobeSubmitBucket3P)
+	overloadKey := adobeSubmitKey(adobeRenderOverloadKeyPrefix, adobeSubmitBucket3P)
+	service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 32, adobeOverloadWindow, time.Hour)
+	firstAttempt.finish(false)
+
+	retried := make(chan *adobeRenderLease, 1)
+	go func() {
+		lease, acquireErr := renderPermit(ctx)
+		if acquireErr == nil {
+			retried <- lease
+		}
+	}()
+	other[0].finish(false)
+	select {
+	case lease := <-retried:
+		lease.finish(false)
+		t.Fatal("retry entered while active renders were still at the reduced limit")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	other[1].finish(false)
+	select {
+	case lease := <-retried:
+		lease.finish(false)
+	case <-time.After(time.Second):
+		t.Fatal("retry did not re-enter after reduced render capacity became available")
+	}
+	other[2].finish(false)
 }

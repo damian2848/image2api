@@ -45,8 +45,12 @@ var (
 	// poll URL. It is endpoint admission pressure rather than evidence of an
 	// account failure, so callers should pace instead of fanning out across tokens.
 	ErrSubmitOverloaded = fmt.Errorf("%w: submit system under load", ErrTemporaryUpstream)
-	ErrDeadUpstream     = errors.New("adobe upstream fatal error")
-	ErrRateLimited      = errors.New("adobe rate limited")
+	// ErrJobOverloaded means Adobe accepted the job but the asynchronous render
+	// later failed under load. Retrying other accounts would create duplicate jobs
+	// and amplify pressure, so callers must treat it as endpoint capacity feedback.
+	ErrJobOverloaded = fmt.Errorf("%w: job system under load", ErrTemporaryUpstream)
+	ErrDeadUpstream  = errors.New("adobe upstream fatal error")
+	ErrRateLimited   = errors.New("adobe rate limited")
 	// ErrContentRejected is Adobe's content-safety filter refusing the prompt or
 	// the generated image (HTTP 451 image_unsafe). It is the prompt's fault, not
 	// the account's — every account rejects the same content — so the caller must
@@ -726,7 +730,7 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 			return nil, nil, readErr
 		}
 		if isSystemOverloaded(string(body)) {
-			return nil, nil, ErrTemporaryUpstream
+			return nil, nil, fmt.Errorf("%w: adobe poll: %s", ErrJobOverloaded, clip(body, 300))
 		}
 		if isContentRejection(resp.StatusCode, string(body)) {
 			return nil, nil, fmt.Errorf("%w: %s", ErrContentRejected, clip(body, 300))
