@@ -41,7 +41,9 @@ type UserGenerateRequest struct {
 	// and charges the per-tier surcharge on top of the model price.
 	DeAI bool
 	// AccountID pins an admin test to one specific provider account (账号生图测试).
-	AccountID string
+	AccountID   string
+	CallMethod  string
+	RequestPort int
 }
 
 func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, in UserGenerateRequest) (map[string]any, error) {
@@ -74,6 +76,8 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
 			ReferenceMode:   strings.TrimSpace(in.ReferenceMode),
+			CallMethod:      in.CallMethod,
+			RequestPort:     in.RequestPort,
 		})
 		if err != nil {
 			return nil, err
@@ -87,6 +91,8 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
 			DeAI:            in.DeAI,
+			CallMethod:      in.CallMethod,
+			RequestPort:     in.RequestPort,
 		})
 		if err != nil {
 			return nil, err
@@ -119,6 +125,8 @@ func (s *UserGenerationService) Start(ctx context.Context, user *model.User, in 
 		Resolution:      in.Resolution,
 		ReferenceImages: in.ReferenceImages,
 		DeAI:            in.DeAI,
+		CallMethod:      in.CallMethod,
+		RequestPort:     in.RequestPort,
 	})
 }
 
@@ -165,6 +173,8 @@ func (s *UserGenerationService) AdminTest(ctx context.Context, user *model.User,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
 			AccountID:       in.AccountID,
+			CallMethod:      in.CallMethod,
+			RequestPort:     in.RequestPort,
 		})
 	default:
 		return s.v1.prepareAdminTestImage(ctx, principal, V1ImageRequest{
@@ -174,6 +184,8 @@ func (s *UserGenerationService) AdminTest(ctx context.Context, user *model.User,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
 			AccountID:       in.AccountID,
+			CallMethod:      in.CallMethod,
+			RequestPort:     in.RequestPort,
 		})
 	}
 }
@@ -230,7 +242,10 @@ func shapeJobEvent(item *model.EventLog, modelNames map[string]string) map[strin
 		"deai":           item.DeAI,
 		"status":         status,
 		"file":           emptyOrNil(item.File),
+		"preview_file":   emptyOrNil(item.PreviewFile),
 		"url":            emptyOrNil(url),
+		"call_method":    item.CallMethod,
+		"request_port":   item.RequestPort,
 		"reference_urls": referenceURLs(item.RefFiles),
 		"elapsed_ms":     item.ElapsedMS,
 		"error":          emptyOrNil(item.Error),

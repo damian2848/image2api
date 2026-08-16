@@ -24,6 +24,8 @@ const search = ref('')
 const page = ref(1)
 const pageSize = 20
 const lightbox = ref(null)
+const previewFile = (e) => e.preview_file || e.file || ''
+const hasPreview = (e) => e.status === 'success' && !!previewFile(e)
 // Video rows whose first-frame thumbnail is missing (old videos) — fall back
 // to the muted <video> preview for those.
 const thumbFail = reactive({})
@@ -68,11 +70,18 @@ onMounted(load)
 
 // Source: backend stamps "v1" for API-key calls, "user"/"admin" for the
 // playground/test page. Collapse to two buckets the user cares about.
-const isApi = (e) => e.source === 'v1'
+const isApi = (e) => e.source === 'v1' || e.source === 'v1_async'
 const sourceLabel = (e) => (isApi(e) ? 'API' : '画图台')
 const sourcePill = (e) => (isApi(e)
   ? 'bg-violet-50 text-violet-700 ring-violet-200'
   : 'bg-sky-50 text-sky-700 ring-sky-200')
+const callMethod = (e) => e.call_method || ({
+  v1: 'API /v1',
+  v1_async: 'API /v1',
+  user: '画图台 /admin/api/generate',
+  admin: '后台测试 /admin/api/test',
+}[e.source] || '—')
+const callPort = (e) => Number(e.request_port) > 0 ? String(e.request_port) : '—'
 
 // 搜索走服务端(跨页)，直接展示服务端返回的当页结果。
 const displayed = computed(() => items.value)
@@ -189,14 +198,15 @@ const params = (e) => {
     </div>
 
     <!-- Table -->
-    <div v-else class="card overflow-hidden !p-0">
-      <table class="w-full text-sm table-fixed log-table">
+    <div v-else class="card overflow-x-auto !p-0">
+      <table class="w-full min-w-[1000px] text-sm table-fixed log-table">
         <colgroup>
           <col class="w-16" />     <!-- preview -->
           <col class="w-28" />     <!-- time -->
           <col class="w-24" />     <!-- status -->
           <col class="w-56" />     <!-- model -->
           <col />                  <!-- prompt/error -->
+          <col class="w-44" />     <!-- call method -->
           <col class="w-40" />     <!-- params -->
           <col class="w-14" />     <!-- cost -->
           <col class="w-16" />     <!-- elapsed -->
@@ -208,6 +218,7 @@ const params = (e) => {
             <th class="text-left px-3 py-3 font-medium">状态</th>
             <th class="text-left px-3 py-3 font-medium">模型</th>
             <th class="text-left px-3 py-3 font-medium">提示词 / 错误</th>
+            <th class="text-left px-3 py-3 font-medium">调用方式</th>
             <th class="text-left px-3 py-3 font-medium">参数</th>
             <th class="text-right px-3 py-3 font-medium">积分</th>
             <th class="text-right px-3 py-3 font-medium">耗时</th>
@@ -216,13 +227,11 @@ const params = (e) => {
         <tbody>
           <tr v-for="e in displayed" :key="e.id" class="log-row">
             <td class="px-3 py-3 align-middle text-center">
-              <!-- API(v1) videos are no-store: file is an external provider URL
-                   (not a RustFS path), so it can't be previewed in-browser — show —. -->
-              <button v-if="e.status === 'success' && e.file && !e.file.startsWith('http')" @click="lightbox = e"
+              <button v-if="hasPreview(e)" @click="lightbox = e"
                       class="block w-11 h-11 mx-auto rounded-lg overflow-hidden ring-1 ring-slate-200 hover:ring-fuchsia-300 transition-all">
-                <img v-if="e.kind !== 'video' || !thumbFail[e.id]" :src="thumbUrl(e.file)" loading="lazy" class="w-full h-full object-cover"
+                <img v-if="e.kind !== 'video' || !thumbFail[e.id]" :src="thumbUrl(previewFile(e))" loading="lazy" class="w-full h-full object-cover"
                      @error="e.kind === 'video' && (thumbFail[e.id] = true)" />
-                <video v-else :src="generatedUrl(e.file)" muted preload="metadata" class="w-full h-full object-cover" />
+                <video v-else :src="generatedUrl(previewFile(e))" muted preload="metadata" class="w-full h-full object-cover" />
               </button>
               <span v-else class="text-slate-300">—</span>
             </td>
@@ -258,6 +267,10 @@ const params = (e) => {
                    :title="e.error + ' — 点击复制'"
                    @click.stop="copyError(e)">⚠ {{ e.error }}</div>
             </td>
+            <td class="px-3 py-3 align-middle min-w-0">
+              <div class="font-mono text-[11px] text-slate-600 truncate" :title="callMethod(e)">{{ callMethod(e) }}</div>
+              <div class="mt-0.5 text-[10px] text-slate-400 tabular-nums">端口 {{ callPort(e) }}</div>
+            </td>
             <td class="px-3 py-3 align-middle text-xs text-slate-500 tabular-nums">{{ params(e) || '—' }}<span v-if="e.deai"> · <span class="text-[#7c3aed]">去AI特征</span></span></td>
             <td class="px-3 py-3 align-middle text-right text-xs text-slate-700 tabular-nums">{{ e.cost ? points(e.cost) : '—' }}</td>
             <td class="px-3 py-3 align-middle text-right text-xs text-slate-500 tabular-nums">{{ e.elapsed_ms ? (e.elapsed_ms / 1000).toFixed(1) + 's' : '—' }}</td>
@@ -284,11 +297,11 @@ const params = (e) => {
 
     <MediaLightbox
       v-if="lightbox"
-      :src="generatedUrl(lightbox.file)"
+      :src="generatedUrl(previewFile(lightbox))"
       :kind="lightbox.kind"
       :prompt="lightbox.prompt"
       :meta="[lightbox.model, lightbox.ratio, lightbox.resolution, lightbox.duration].filter(Boolean).join(' · ')"
-      :download-name="lightbox.file"
+      :download-name="previewFile(lightbox)"
       @close="lightbox = null" />
 
     <div v-if="toast"
