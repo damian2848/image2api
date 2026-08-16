@@ -221,6 +221,10 @@ type V1ImageRequest struct {
 	// used to build absolute, directly-downloadable output URLs. Empty falls
 	// back to a relative "/images/..." path.
 	BaseURL string
+	// CallMethod and RequestPort describe how the request entered the service.
+	// They are persisted on the event log for operational visibility.
+	CallMethod  string
+	RequestPort int
 	// AccountID pins the generation to one specific provider account (admin
 	// account-test). Empty keeps the normal pool selection with failover.
 	AccountID string
@@ -235,7 +239,9 @@ type V1VideoRequest struct {
 	ReferenceImages []string
 	ReferenceMode   string // "frame" or "asset", overrides model default
 	// BaseURL — see V1ImageRequest.BaseURL.
-	BaseURL string
+	BaseURL     string
+	CallMethod  string
+	RequestPort int
 	// AccountID — see V1ImageRequest.AccountID.
 	AccountID string
 }
@@ -310,18 +316,23 @@ func (s *V1Service) checkBannedPrompt(ctx context.Context, principal *APIPrincip
 // logRejectedEvent records a request rejected BEFORE the pending event exists
 // (banned word, concurrency full, unknown model, insufficient credits…) as a
 // failed event, so every attempt shows up in the logs.
-func (s *V1Service) logRejectedEvent(ctx context.Context, kind, modelID string, principal *APIPrincipal, prompt, source, reason string) {
+func (s *V1Service) logRejectedEvent(ctx context.Context, kind, modelID string, principal *APIPrincipal, prompt, source, callMethod string, requestPort int, reason string) {
+	if strings.TrimSpace(callMethod) == "" {
+		callMethod = callMethodForSource(source)
+	}
 	event := &model.EventLog{
-		ID:        "evt-" + randomUpper(12),
-		TS:        time.Now(),
-		Kind:      kind,
-		Status:    "failed",
-		Model:     strings.TrimSpace(modelID),
-		Prompt:    prompt,
-		Source:    source,
-		Error:     reason,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:          "evt-" + randomUpper(12),
+		TS:          time.Now(),
+		Kind:        kind,
+		Status:      "failed",
+		Model:       strings.TrimSpace(modelID),
+		Prompt:      prompt,
+		Source:      source,
+		CallMethod:  callMethod,
+		RequestPort: requestPort,
+		Error:       reason,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
 	}
 	if m, err := s.models.Get(ctx, event.Model); err == nil {
 		event.Model = m.ID
@@ -331,6 +342,19 @@ func (s *V1Service) logRejectedEvent(ctx context.Context, kind, modelID string, 
 		event.UserID = principal.User.ID
 	}
 	_ = s.events.Create(ctx, event)
+}
+
+func callMethodForSource(source string) string {
+	switch strings.TrimSpace(source) {
+	case "v1", "v1_async":
+		return "API /v1"
+	case "admin":
+		return "后台测试 /admin/api/test"
+	case "user":
+		return "画图台 /admin/api/generate"
+	default:
+		return strings.TrimSpace(source)
+	}
 }
 
 // refreshAdobeToken re-mints an Adobe account's access token from its cookie
@@ -458,7 +482,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	ctx = context.WithoutCancel(ctx)
 	if source != "admin" {
 		if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
-			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err.Error())
+			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, err.Error())
 			return nil, err
 		}
 	}
@@ -475,7 +499,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	if source != "admin" && principal != nil && principal.User != nil {
 		slot := randomUpper(12)
 		if !s.userAcquire(ctx, principal.User, slot) {
-			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
+			s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, ErrUserConcurrencyFull.Error())
 			return nil, ErrUserConcurrencyFull
 		}
 		defer s.userRelease(ctx, principal.User.ID, slot)
@@ -483,7 +507,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 
 	modelItem, resolution, aspectRatio, price, err := s.prepareImage(ctx, principal, in, charge)
 	if err != nil {
-		s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, err.Error())
+		s.logRejectedEvent(ctx, "image", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, err.Error())
 		return nil, err
 	}
 	refCount := len(in.ReferenceImages)
@@ -503,7 +527,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	// ({base}/v1/images/{eventID}/content) that re-fetches with the account token.
 	var upstreamURL string
 	var gatedURL bool
-	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, nil, in.DeAI)
+	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, in.CallMethod, in.RequestPort, nil, in.DeAI)
 	if err != nil {
 		return nil, err
 	}
@@ -519,7 +543,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	var imageBytes []byte
 	switch s.effectiveProvider(genCtx, modelItem) {
 	case "adobe":
-		b, u, execErr := s.generateAdobeImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateAdobeImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, false)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -537,7 +561,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		imageBytes = b
 		upstreamURL = u
 	case "chatgpt":
-		b, u, execErr := s.generateChatGPTImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateChatGPTImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, false)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -556,7 +580,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		upstreamURL = u
 		gatedURL = true // chatgpt URL needs the account token → proxy it
 	case "leonardo":
-		b, u, execErr := s.generateLeonardoImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateLeonardoImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, false)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -574,7 +598,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		imageBytes = b
 		upstreamURL = u
 	case "krea":
-		b, u, execErr := s.generateKreaImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateKreaImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, false)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -592,7 +616,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		imageBytes = b
 		upstreamURL = u
 	case "imagine":
-		b, u, execErr := s.generateImagineImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateImagineImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, false)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -610,7 +634,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		imageBytes = b
 		upstreamURL = u
 	case "grok":
-		b, u, execErr := s.generateGrokImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateGrokImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, false)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -628,7 +652,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		imageBytes = b
 		upstreamURL = u
 	case "runway":
-		b, u, execErr := s.generateRunwayImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateRunwayImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, false)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -646,7 +670,7 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		imageBytes = b
 		upstreamURL = u
 	case "custom":
-		b, u, execErr := s.generateCustomImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, noStore)
+		b, u, execErr := s.generateCustomImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, false)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -688,6 +712,13 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		if thumb, terr := makeThumbnail(imageBytes); terr == nil {
 			_ = s.store.Put(genCtx, ThumbKey(relativePath), thumb, "image/jpeg")
 		}
+	}
+	if noStore {
+		// API responses continue to expose the upstream URL, but the log UI needs
+		// a durable, permission-checked object for its preview thumbnail. This is
+		// best-effort so a storage hiccup never turns a successful API generation
+		// into an API failure.
+		s.storeAPIPreview(ctx, principal, eventID, imageBytes)
 	}
 	if source == "v1_async" {
 		if err := s.storeAsyncImageResult(ctx, principal, eventID, imageBytes, upstreamURL, in.BaseURL); err != nil {
@@ -758,6 +789,20 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 		"charged":    price,
 		"credits":    principalCredits(principal),
 	}, nil
+}
+
+func (s *V1Service) storeAPIPreview(ctx context.Context, principal *APIPrincipal, eventID string, imageBytes []byte) {
+	if len(imageBytes) == 0 || s.store == nil || !s.store.Configured() {
+		return
+	}
+	_, rel := s.allocateOutput(principal, imageExtFromBytes(imageBytes), "")
+	if err := s.store.Put(ctx, rel, imageBytes, contentTypeForExt(imageExtFromBytes(imageBytes))); err != nil {
+		return
+	}
+	if thumb, err := makeThumbnail(imageBytes); err == nil {
+		_ = s.store.Put(ctx, ThumbKey(rel), thumb, "image/jpeg")
+	}
+	_ = s.events.SetPreviewFile(ctx, eventID, rel)
 }
 
 // StartAsyncImageRequest creates an image event using the same validation,
@@ -917,7 +962,7 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	ctx = context.WithoutCancel(ctx)
 	if source != "admin" {
 		if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
-			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
+			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, err.Error())
 			return nil, err
 		}
 	}
@@ -928,7 +973,7 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	if source != "admin" && principal != nil && principal.User != nil {
 		slot := randomUpper(12)
 		if !s.userAcquire(ctx, principal.User, slot) {
-			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, ErrUserConcurrencyFull.Error())
+			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, ErrUserConcurrencyFull.Error())
 			return nil, ErrUserConcurrencyFull
 		}
 		defer s.userRelease(ctx, principal.User.ID, slot)
@@ -936,7 +981,7 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 
 	modelItem, resolution, aspectRatio, duration, price, err := s.prepareVideo(ctx, principal, in, charge)
 	if err != nil {
-		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
+		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, in.CallMethod, in.RequestPort, err.Error())
 		return nil, err
 	}
 	refCount := len(in.ReferenceImages)
@@ -947,7 +992,7 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	if !noStore {
 		fileURL, relativePath = s.allocateOutput(principal, "mp4", in.BaseURL)
 	}
-	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, refCount, price, relativePath, source, nil, false)
+	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, refCount, price, relativePath, source, in.CallMethod, in.RequestPort, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1088,7 +1133,7 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
 	ctx = context.WithoutCancel(ctx)
 	if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
-		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
+		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", in.CallMethod, in.RequestPort, err.Error())
 		return nil, err
 	}
 	// Validate reference_mode against model capabilities and reference count
@@ -1097,14 +1142,14 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 	modelItem, err := s.models.Get(ctx, strings.TrimSpace(in.Model))
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", ErrUnknownModel.Error())
+			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", in.CallMethod, in.RequestPort, ErrUnknownModel.Error())
 			return nil, ErrUnknownModel
 		}
 		return nil, err
 	}
 	if rm := strings.TrimSpace(in.ReferenceMode); rm != "" {
 		if err := validateReferenceMode(rm, modelItem, len(in.ReferenceImages)); err != nil {
-			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
+			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", in.CallMethod, in.RequestPort, err.Error())
 			return nil, err
 		}
 		if rm == modelItem.ReferenceMode {
@@ -1113,12 +1158,12 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 	}
 	modelItem, resolution, aspectRatio, duration, price, err := s.prepareVideo(ctx, principal, in, true)
 	if err != nil {
-		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
+		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", in.CallMethod, in.RequestPort, err.Error())
 		return nil, err
 	}
 	// Source "v1": no output file is allocated — the result is the upstream URL,
 	// stored on the event when the render completes.
-	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages), price, "", "v1", nil, false)
+	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages), price, "", "v1", in.CallMethod, in.RequestPort, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1697,25 +1742,30 @@ func (s *V1Service) allocateOutput(principal *APIPrincipal, ext, baseURL string)
 	return "/images/" + relativePath, relativePath
 }
 
-func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem *model.ModelConfig, principal *APIPrincipal, prompt, ratio, resolution, duration string, refs int, cost float64, file, source string, refFiles []string, deai bool) (string, error) {
+func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem *model.ModelConfig, principal *APIPrincipal, prompt, ratio, resolution, duration string, refs int, cost float64, file, source, callMethod string, requestPort int, refFiles []string, deai bool) (string, error) {
+	if strings.TrimSpace(callMethod) == "" {
+		callMethod = callMethodForSource(source)
+	}
 	event := &model.EventLog{
-		ID:         "evt-" + randomUpper(12),
-		TS:         time.Now(),
-		Kind:       kind,
-		Status:     "pending",
-		Model:      modelItem.ID,
-		Provider:   modelItem.Provider,
-		Prompt:     prompt,
-		Ratio:      ratio,
-		Resolution: resolution,
-		Duration:   duration,
-		Refs:       refs,
-		DeAI:       deai,
-		Source:     source,
-		Cost:       cost,
-		File:       file,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		ID:          "evt-" + randomUpper(12),
+		TS:          time.Now(),
+		Kind:        kind,
+		Status:      "pending",
+		Model:       modelItem.ID,
+		Provider:    modelItem.Provider,
+		Prompt:      prompt,
+		Ratio:       ratio,
+		Resolution:  resolution,
+		Duration:    duration,
+		Refs:        refs,
+		DeAI:        deai,
+		Source:      source,
+		CallMethod:  callMethod,
+		RequestPort: requestPort,
+		Cost:        cost,
+		File:        file,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
 	}
 	if len(refFiles) > 0 {
 		event.RefFiles = jsonArray(refFiles)
@@ -1747,6 +1797,13 @@ const grokConcurrencyPerAccount = 10
 // After this many accounts fail this way, the request fails.
 const maxTempDeadAccounts = 10
 
+// poolRetryRounds is the total number of account-pool passes for transient
+// failures. A single bounded retry gives accounts that just released a slot,
+// or an upstream that just recovered, a chance without multiplying provider
+// jobs indefinitely. Auth, quota, and request-level errors are never retried.
+const poolRetryRounds = 2
+const poolRetryDelay = 500 * time.Millisecond
+
 // runPoolWithFailover drives a generation across a round-robin-ordered account
 // list with per-error-class behavior, so a bad request never burns the whole
 // pool while genuinely limited accounts still fail over:
@@ -1758,7 +1815,8 @@ const maxTempDeadAccounts = 10
 //     chatgpt's JWT IS the credential), mark the account and fail over.
 //   - 上游临时 temporary → record the failure (no disable/dead) and FAIL OVER to
 //     the next account immediately, capped at maxTempDeadAccounts accounts so a
-//     pool-wide blip can't fan a single request out across everything.
+//     pool-wide blip can't fan a single request out across everything. If every
+//     account in the pass is temporary/busy, make one delayed pool pass.
 //   - 参数错 / request-level (anything else) → return immediately, no retry, no
 //     account penalty (the account isn't at fault).
 //
@@ -1774,6 +1832,42 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 	tempFailover bool,
 ) ([]byte, error) {
 	var lastErr error
+	for round := 0; round < poolRetryRounds; round++ {
+		data, err, retryable := s.runPoolWithFailoverRound(ctx, eventID, pool, active, kind, attempt, classify, refreshOnAuth, tempFailover)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		if !retryable || round == poolRetryRounds-1 {
+			return nil, err
+		}
+		timer := time.NewTimer(poolRetryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+// runPoolWithFailoverRound performs one ordered pass over the eligible
+// accounts. The third return value tells the outer driver whether a second
+// pass is safe: only transient upstream failures or temporary account
+// contention qualify.
+func (s *V1Service) runPoolWithFailoverRound(ctx context.Context, eventID, pool string, active []model.TokenAccount, kind string,
+	attempt func(token model.TokenAccount) ([]byte, error),
+	classify func(error) (isAuth, isQuota, isTemporary, isDead bool),
+	refreshOnAuth func(tokenID string) (model.TokenAccount, bool),
+	tempFailover bool,
+) ([]byte, error, bool) {
+	var lastErr error
 	busy := 0
 	tempDeadCount := 0
 	for _, token := range active {
@@ -1788,7 +1882,7 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 			return s.tryAccount(ctx, eventID, pool, token, kind, attempt, classify, refreshOnAuth, tempFailover)
 		}()
 		if err == nil {
-			return data, nil
+			return data, nil, false
 		}
 		lastErr = err
 		if tempDead {
@@ -1797,24 +1891,24 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 			// upstream-wide blip doesn't fan out across the whole pool.
 			tempDeadCount++
 			if tempDeadCount >= maxTempDeadAccounts {
-				return nil, lastErr
+				return nil, lastErr, true
 			}
 		}
 		if failover {
 			continue
 		}
 		// temporary exhausted or request-level error → surface it, no fan-out.
-		return nil, lastErr
+		return nil, lastErr, tempDeadCount > 0
 	}
 	// Nothing ran. If accounts were skipped ONLY because they were all busy
 	// (no real failure), tell the caller the pool is at its concurrency cap.
 	if lastErr == nil {
 		if busy > 0 {
-			return nil, ErrConcurrencyFull
+			return nil, ErrConcurrencyFull, true
 		}
-		return nil, ErrProviderExecution
+		return nil, ErrProviderExecution, false
 	}
-	return nil, lastErr
+	return nil, lastErr, tempDeadCount > 0 || busy > 0
 }
 
 // tryAccount runs one account's attempt with the pool's retry policy:

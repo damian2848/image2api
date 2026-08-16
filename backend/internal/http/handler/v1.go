@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -175,6 +176,8 @@ func (h *V1Handler) imageGenerationRequest(c *gin.Context) (service.V1ImageReque
 		AspectRatio:     body.AspectRatio,
 		ReferenceImages: references,
 		BaseURL:         requestBaseURL(c),
+		CallMethod:      requestCallMethod(c),
+		RequestPort:     requestPort(c),
 	}, nil
 }
 
@@ -211,6 +214,8 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		AspectRatio:     c.PostForm("aspect_ratio"),
 		ReferenceImages: refs,
 		BaseURL:         requestBaseURL(c),
+		CallMethod:      requestCallMethod(c),
+		RequestPort:     requestPort(c),
 	})
 	if err != nil {
 		h.writeV1Error(c, err, resp)
@@ -275,6 +280,8 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		ReferenceImages: refs,
 		ReferenceMode:   referenceMode,
 		BaseURL:         requestBaseURL(c),
+		CallMethod:      requestCallMethod(c),
+		RequestPort:     requestPort(c),
 	})
 	if err != nil {
 		h.writeV1Error(c, err, nil)
@@ -497,4 +504,39 @@ func requestBaseURL(c *gin.Context) string {
 		scheme = "https"
 	}
 	return scheme + "://" + host
+}
+
+func requestCallMethod(c *gin.Context) string {
+	path := c.Request.URL.Path
+	switch {
+	case strings.HasPrefix(path, "/v1/"):
+		return "API /v1"
+	case strings.HasSuffix(path, "/test"):
+		return "后台测试 /admin/api/test"
+	case strings.HasSuffix(path, "/generate"):
+		return "画图台 /admin/api/generate"
+	default:
+		return path
+	}
+}
+
+func requestPort(c *gin.Context) int {
+	for _, raw := range []string{c.GetHeader("X-Forwarded-Port"), c.Request.Host} {
+		value := strings.TrimSpace(strings.Split(raw, ",")[0])
+		if value == "" {
+			continue
+		}
+		if _, port, err := net.SplitHostPort(value); err == nil {
+			if n, err := strconv.Atoi(port); err == nil && n > 0 && n <= 65535 {
+				return n
+			}
+		}
+		if n, err := strconv.Atoi(value); err == nil && n > 0 && n <= 65535 {
+			return n
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(strings.Split(c.GetHeader("X-Forwarded-Proto"), ",")[0]), "https") || c.Request.TLS != nil {
+		return 443
+	}
+	return 80
 }

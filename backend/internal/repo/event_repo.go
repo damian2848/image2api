@@ -400,22 +400,46 @@ func (r *EventRepository) PurgeOlderThan(ctx context.Context, maxAge time.Durati
 	return result.RowsAffected, nil
 }
 
-// ClearFiles blanks the `file` column on any event rows that point at one of the
-// given relative paths. Called after media retention deletes the files on disk so
-// the log views don't dangle a 404 image — an emptied `file` reads as "no preview"
-// ("—" in admin logs; hidden in the customer records page).
+// ClearFiles blanks stored media references on any event rows that point at one
+// of the given relative paths. Called after media retention deletes the files on
+// disk so the log views don't dangle a 404 image.
 func (r *EventRepository) ClearFiles(ctx context.Context, relPaths []string) (int64, error) {
 	if len(relPaths) == 0 {
 		return 0, nil
 	}
-	result := r.db.WithContext(ctx).
-		Model(&model.EventLog{}).
-		Where("file IN ?", relPaths).
-		Updates(map[string]any{"file": "", "updated_at": time.Now()})
-	if result.Error != nil {
-		return 0, result.Error
+	db := r.db.WithContext(ctx)
+	var changed int64
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.EventLog{}).
+			Where("file IN ?", relPaths).
+			Updates(map[string]any{"file": "", "updated_at": time.Now()})
+		if result.Error != nil {
+			return result.Error
+		}
+		changed += result.RowsAffected
+
+		result = tx.Model(&model.EventLog{}).
+			Where("preview_file IN ?", relPaths).
+			Updates(map[string]any{"preview_file": "", "updated_at": time.Now()})
+		if result.Error != nil {
+			return result.Error
+		}
+		changed += result.RowsAffected
+		return nil
+	}); err != nil {
+		return 0, err
 	}
-	return result.RowsAffected, nil
+	return changed, nil
+}
+
+// SetPreviewFile records the private stored copy used by the log preview. It
+// deliberately does not populate File, because API responses keep their
+// provider URL and should not enter the normal gallery/download flow.
+func (r *EventRepository) SetPreviewFile(ctx context.Context, eventID, relPath string) error {
+	return r.db.WithContext(ctx).
+		Model(&model.EventLog{}).
+		Where("id = ?", eventID).
+		Update("preview_file", relPath).Error
 }
 
 // ClearRefFiles blanks the ref_files paths on one event (called after a

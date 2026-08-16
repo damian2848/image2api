@@ -98,6 +98,12 @@ type EventLog struct {
 	DeAI       bool           `gorm:"not null;default:false"` // 去AI特征 was applied (image only)
 	RefFiles   datatypes.JSON `gorm:"type:jsonb"`             // relative paths of saved reference images, for回显 on reload
 	Source     string         `gorm:"size:32;index"`
+	// CallMethod identifies the public entry point (API /v1, playground, or
+	// admin test) independently from the provider selected for the generation.
+	CallMethod string `gorm:"size:64;index"`
+	// RequestPort is the port visible on the inbound request after proxy headers
+	// are applied. It is 0 for legacy rows where the value was not captured.
+	RequestPort int `gorm:"not null;default:0"`
 	// AccountID is the provider token/account chosen to fulfil this generation,
 	// stamped when the upstream call begins. Drives the accounts view's live
 	// in-flight count (pending events per account) and lets an abandoned-event
@@ -115,9 +121,13 @@ type EventLog struct {
 	Refunded  bool   `gorm:"not null;default:false"`
 	ElapsedMS int    `gorm:"not null;default:0"`
 	File      string `gorm:"size:500;index"`
-	Error     string `gorm:"type:text"`
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	// PreviewFile is a private stored copy used by log previews. API responses
+	// continue returning their provider URL; this field is intentionally separate
+	// from File so API media does not enter the normal gallery/download flow.
+	PreviewFile string `gorm:"size:500;index"`
+	Error       string `gorm:"type:text"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 type ModelConfig struct {

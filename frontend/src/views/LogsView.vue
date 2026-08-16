@@ -109,10 +109,10 @@ function fmtWhen(ts) {
 const thumbFail = reactive({})
 
 const previewing = ref(null)   // entry whose generated file is open in the lightbox
+const previewFile = (e) => e.preview_file || e.file || ''
+const hasPreview = (e) => e.status === 'success' && !!previewFile(e)
 function openPreview(e) {
-  // API (v1) outputs aren't persisted/served by us (image=b64 inline, video=an
-  // upstream URL for /content) — no in-log preview, same as images. Skip them.
-  if (e.status !== 'success' || !e.file || e.source === 'v1') return
+  if (!hasPreview(e)) return
   previewing.value = e
 }
 function closePreview() { previewing.value = null }
@@ -143,12 +143,21 @@ const statusDot = (s) => ({
 }[s] || 'bg-white/40')
 
 // Source: backend stamps "v1" (API key), "user" (画图台), "admin" (后台测试模型).
-const sourceLabel = (s) => ({ v1: 'API', user: '画图台', admin: '测试' }[s] || '画图台')
+const sourceLabel = (s) => ({ v1: 'API', v1_async: 'API', user: '画图台', admin: '测试' }[s] || '画图台')
 const sourcePill = (s) => ({
   v1:    'bg-violet-500/15 text-violet-300 ring-violet-400/30',
+  v1_async: 'bg-violet-500/15 text-violet-300 ring-violet-400/30',
   admin: 'bg-amber-500/15 text-amber-300 ring-amber-400/30',
   user:  'bg-sky-500/15 text-sky-300 ring-sky-400/30',
 }[s] || 'bg-sky-500/15 text-sky-300 ring-sky-400/30')
+
+const callMethod = (e) => e.call_method || ({
+  v1: 'API /v1',
+  v1_async: 'API /v1',
+  user: '画图台 /admin/api/generate',
+  admin: '后台测试 /admin/api/test',
+}[e.source] || '—')
+const callPort = (e) => Number(e.request_port) > 0 ? String(e.request_port) : '—'
 </script>
 
 <template>
@@ -214,7 +223,7 @@ const sourcePill = (s) => ({
     </div>
 
     <!-- Table -->
-    <div class="card overflow-hidden">
+    <div class="card overflow-x-auto">
       <div v-if="loading && !items.length" class="text-center text-sm text-white/40 py-20">加载中…</div>
       <div v-else-if="!filtered.length" class="flex flex-col items-center gap-3 text-white/40 py-20">
         <span class="w-14 h-14 rounded-2xl bg-white/[0.04] grid place-items-center"><Icon name="files" class="w-6 h-6" /></span>
@@ -222,9 +231,9 @@ const sourcePill = (s) => ({
       </div>
 
       <!-- Each row is a thumbnail + a stack of model/prompt + a meta line.
-           Beats a 9-column table for scanability — the eye lands on the
+           Beats a 10-column table for scanability — the eye lands on the
            image first, then reads the model + intent, then params. -->
-      <table v-else class="w-full text-sm table-fixed log-table">
+      <table v-else class="w-full min-w-[1120px] text-sm table-fixed log-table">
         <colgroup>
           <col class="w-20" />        <!-- preview -->
           <col class="w-32" />        <!-- time -->
@@ -232,6 +241,7 @@ const sourcePill = (s) => ({
           <col class="w-28" />        <!-- user -->
           <col class="w-56" />        <!-- model -->
           <col />                     <!-- prompt + error -->
+          <col class="w-44" />        <!-- call method -->
           <col class="w-48" />        <!-- params -->
           <col class="w-16" />        <!-- credits -->
           <col class="w-16" />        <!-- elapsed -->
@@ -244,6 +254,7 @@ const sourcePill = (s) => ({
             <th class="text-left px-3 py-3 font-medium">用户 / 账号</th>
             <th class="text-left px-3 py-3 font-medium">模型</th>
             <th class="text-left px-3 py-3 font-medium">提示词 / 错误</th>
+            <th class="text-left px-3 py-3 font-medium">调用方式</th>
             <th class="text-left px-3 py-3 font-medium">参数</th>
             <th class="text-right px-3 py-3 font-medium">积分</th>
             <th class="text-right px-4 py-3 font-medium">耗时</th>
@@ -252,13 +263,13 @@ const sourcePill = (s) => ({
         <tbody>
           <tr v-for="e in filtered" :key="e.id" class="log-row">
             <td class="px-4 py-3.5 align-middle text-center">
-              <button v-if="e.status === 'success' && e.file && e.source !== 'v1'"
+              <button v-if="hasPreview(e)"
                       @click="openPreview(e)"
                       class="block w-12 h-12 mx-auto rounded-lg overflow-hidden ring-1 ring-white/10 hover:ring-fuchsia-400/60 transition-all">
-                <img v-if="e.kind !== 'video' || !thumbFail[e.id]" :src="thumbUrl(e.file)" loading="lazy"
+                <img v-if="e.kind !== 'video' || !thumbFail[e.id]" :src="thumbUrl(previewFile(e))" loading="lazy"
                      class="w-full h-full object-cover"
                      @error="e.kind === 'video' && (thumbFail[e.id] = true)" />
-                <video v-else :src="generatedUrl(e.file)" muted loop preload="metadata" playsinline
+                <video v-else :src="generatedUrl(previewFile(e))" muted loop preload="metadata" playsinline
                        class="w-full h-full object-cover"
                        @mouseenter="$event.target.play && $event.target.play()"
                        @mouseleave="$event.target.pause && $event.target.pause()" />
@@ -312,6 +323,10 @@ const sourcePill = (s) => ({
                 {{ e.error }}
               </div>
             </td>
+            <td class="px-3 py-3.5 align-middle min-w-0">
+              <div class="font-mono text-[11px] text-white/75 truncate" :title="callMethod(e)">{{ callMethod(e) }}</div>
+              <div class="mt-0.5 text-[10px] text-white/40 tabular-nums">端口 {{ callPort(e) }}</div>
+            </td>
             <!-- Compact single-line params, dot-separated. -->
             <td class="px-3 py-3.5 align-middle text-[11px] text-white/55 font-mono whitespace-nowrap tabular-nums">
               <span>{{ e.ratio || '—' }}</span>
@@ -360,11 +375,11 @@ const sourcePill = (s) => ({
     <!-- Lightbox (shared component) -->
     <MediaLightbox
       v-if="previewing"
-      :src="generatedUrl(previewing.file)"
+      :src="generatedUrl(previewFile(previewing))"
       :kind="previewing.kind"
       :prompt="previewing.prompt"
       :meta="[previewing.model, previewing.ratio, previewing.resolution, previewing.duration, fmtMs(previewing.elapsed_ms)].filter(Boolean).join(' · ')"
-      :download-name="previewing.file"
+      :download-name="previewFile(previewing)"
       @close="closePreview" />
 
     <div v-if="toast"
