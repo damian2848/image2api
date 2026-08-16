@@ -1,11 +1,8 @@
-# Public HTTP override for the current Tencent Lighthouse instance.
-# Keep the base compose file on :2000 for local development and put TLS/domain
-# routing in a separate reverse proxy when additional sites are deployed.
+# Production override for an HTTPS reverse proxy on the host.
+# Set IMAGE_PUBLIC_ORIGIN to the exact public origin, for example
+# https://image.example.com. The application itself remains private on :2000.
 services:
   backend:
     environment:
-      CORS_ORIGINS: http://43.128.10.245,http://43.128.10.245:2000
-
-  web:
-    ports:
-      - "80:2000"
+      CORS_ORIGINS: ${IMAGE_PUBLIC_ORIGIN:?IMAGE_PUBLIC_ORIGIN must be set to the public HTTPS origin}
+      COOKIE_SECURE: "true"
