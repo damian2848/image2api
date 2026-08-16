@@ -531,6 +531,11 @@ func (s *V1Service) prepareImageExecutionWithStart(ctx context.Context, principa
 	if err != nil {
 		return nil, err
 	}
+	// Keep the first reference image as a private log preview before contacting
+	// the provider. If generation fails, this lets the operator inspect the
+	// exact input that triggered the failure. A successful API request replaces
+	// it with the generated output below; stored UI requests use EventLog.File.
+	s.storeReferencePreview(ctx, principal, eventID, in.ReferenceImages)
 	// Register so the maintenance sweep can cancel this generation if it abandons
 	// the row; deregister on return.
 	s.inflight.Add(eventID, cancel)
@@ -803,6 +808,49 @@ func (s *V1Service) storeAPIPreview(ctx context.Context, principal *APIPrincipal
 		_ = s.store.Put(ctx, ThumbKey(rel), thumb, "image/jpeg")
 	}
 	_ = s.events.SetPreviewFile(ctx, eventID, rel)
+}
+
+// storeReferencePreview makes the first valid image reference available to a
+// failed image event without putting it in File (which would incorrectly make
+// it a generated gallery item). Reference previews are intentionally named
+// with "-ref-" so the media scanner excludes them from generated work.
+//
+// It is best-effort: observability storage must not affect generation or
+// accounting when RustFS is temporarily unavailable.
+func (s *V1Service) storeReferencePreview(ctx context.Context, principal *APIPrincipal, eventID string, inputs []string) {
+	if len(inputs) == 0 || s.store == nil || !s.store.Configured() {
+		return
+	}
+	imageBytes, thumbnail := previewReferenceImage(inputs)
+	if len(imageBytes) == 0 {
+		return
+	}
+	rel := s.allocateReferencePreview(principal, imageExtFromBytes(imageBytes))
+	if err := s.store.Put(ctx, rel, imageBytes, contentTypeForExt(imageExtFromBytes(imageBytes))); err != nil {
+		return
+	}
+	if len(thumbnail) > 0 {
+		_ = s.store.Put(ctx, ThumbKey(rel), thumbnail, "image/jpeg")
+	}
+	_ = s.events.SetPreviewFile(ctx, eventID, rel)
+}
+
+// previewReferenceImage finds the first base64 reference that is actually
+// decodable as an image. makeThumbnail doubles as a format check and avoids a
+// second decode when uploading the list-view thumbnail.
+func previewReferenceImage(inputs []string) ([]byte, []byte) {
+	for _, input := range inputs {
+		decoded, err := decodeReferenceImages([]string{input}, 1)
+		if err != nil || len(decoded) == 0 {
+			continue
+		}
+		thumbnail, err := makeThumbnail(decoded[0])
+		if err != nil {
+			continue
+		}
+		return decoded[0], thumbnail
+	}
+	return nil, nil
 }
 
 // StartAsyncImageRequest creates an image event using the same validation,
@@ -1742,6 +1790,13 @@ func (s *V1Service) allocateOutput(principal *APIPrincipal, ext, baseURL string)
 	return "/images/" + relativePath, relativePath
 }
 
+// allocateReferencePreview reserves a private image key for a failed-request
+// preview. The -ref- marker is used by the gallery scanner to skip references.
+func (s *V1Service) allocateReferencePreview(principal *APIPrincipal, ext string) string {
+	filename := time.Now().Format("20060102-150405") + "-ref-preview-" + randomUpper(8) + "." + strings.TrimPrefix(ext, ".")
+	return filepath.ToSlash(filepath.Join(s.userDir(principal), filename))
+}
+
 func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem *model.ModelConfig, principal *APIPrincipal, prompt, ratio, resolution, duration string, refs int, cost float64, file, source, callMethod string, requestPort int, refFiles []string, deai bool) (string, error) {
 	if strings.TrimSpace(callMethod) == "" {
 		callMethod = callMethodForSource(source)
@@ -1791,10 +1846,35 @@ const videoGenBudget = 30 * time.Minute
 // may run (grok tolerates 10, unlike the 1-per-account default elsewhere).
 const grokConcurrencyPerAccount = 10
 
-// maxTempDeadAccounts caps how many accounts the "temporary error = fail over"
-// policy may burn per request before giving up, so an upstream-wide blip
-// ("system under load") can't fan a single request out across the whole pool.
-// After this many accounts fail this way, the request fails.
+const (
+	// Adobe submit admission is independent per upstream endpoint. Each bucket
+	// starts conservatively, grows additively after accepted submits, and halves
+	// on overload. Accepted jobs continue polling at full account concurrency.
+	adobeSubmitInitialConcurrency   = 4
+	adobeSubmitMinConcurrency       = 1
+	adobeSubmitMaxConcurrency       = 16
+	adobeSubmitMinLease             = time.Second
+	adobeSubmitAcquirePoll          = 100 * time.Millisecond
+	adobeSubmitSuccessesPerIncrease = 20
+	adobeSubmitAdaptiveTTL          = time.Hour
+
+	adobeOverloadRetries       = 2
+	adobeOverloadRetryBase     = 2 * time.Second
+	adobeOverloadWindow        = 10 * time.Second
+	adobeOverloadTripThreshold = 3
+	adobeOverloadBasePause     = 5 * time.Second
+	adobeOverloadMaxPause      = 20 * time.Second
+
+	adobeSubmitSlotsKeyPrefix    = "conc:p:adobe:submit:"
+	adobeSubmitLimitKeyPrefix    = "limit:p:adobe:submit:"
+	adobeSubmitSuccessKeyPrefix  = "success:p:adobe:submit:"
+	adobeSubmitOverloadKeyPrefix = "overload:p:adobe:submit:"
+	adobeSubmitCooldownKeyPrefix = "pause:p:adobe:submit:"
+)
+
+// maxTempDeadAccounts caps how many accounts an account/network-specific
+// temporary error may burn before giving up. Adobe's explicit submit-overload
+// response bypasses this path and uses endpoint pacing/cooldown instead.
 const maxTempDeadAccounts = 10
 
 // poolRetryRounds is the total number of account-pool passes for transient
@@ -1814,9 +1894,10 @@ const poolRetryDelay = 500 * time.Millisecond
 //     fresh token; if it still auth-fails (or there's nothing to refresh, e.g.
 //     chatgpt's JWT IS the credential), mark the account and fail over.
 //   - 上游临时 temporary → record the failure (no disable/dead) and FAIL OVER to
-//     the next account immediately, capped at maxTempDeadAccounts accounts so a
-//     pool-wide blip can't fan a single request out across everything. If every
-//     account in the pass is temporary/busy, make one delayed pool pass.
+//     the next account immediately, capped at maxTempDeadAccounts accounts. An
+//     explicit endpoint submit overload is handled before classification,
+//     without account penalty or failover. If every account in the pass is
+//     temporary/busy, make one delayed pool pass.
 //   - 参数错 / request-level (anything else) → return immediately, no retry, no
 //     account penalty (the account isn't at fault).
 //
@@ -1922,8 +2003,12 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 	refreshOnAuth func(tokenID string) (model.TokenAccount, bool),
 	tempFailover bool,
 ) ([]byte, error, bool, bool) {
-	_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
-	_ = s.tokens.TouchLastUsed(ctx, token.ID)
+	if s.events != nil {
+		_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
+	}
+	if s.tokens != nil {
+		_ = s.tokens.TouchLastUsed(ctx, token.ID)
+	}
 	authRefreshed := false
 	if strings.TrimSpace(token.Value) == "" && refreshOnAuth != nil {
 		if refreshed, ok := refreshOnAuth(token.ID); ok {
@@ -1943,6 +2028,12 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				"fails":         0,
 			})
 			return data, nil, false, false
+		}
+		// Adobe explicitly rejected the submit before creating a job. This is a
+		// endpoint pressure signal, not an account fault: do not increment the
+		// token's failure counters or fan the request out across more accounts.
+		if errors.Is(err, adobe.ErrSubmitOverloaded) {
+			return nil, err, false, false
 		}
 		isAuth, isQuota, isTemp, isDead := classify(err)
 		if isQuota {
@@ -1997,6 +2088,199 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 
 func adobeErrClass(e error) (bool, bool, bool, bool) {
 	return errors.Is(e, adobe.ErrAuth), errors.Is(e, adobe.ErrQuotaExhausted), errors.Is(e, adobe.ErrTemporaryUpstream) || errors.Is(e, adobe.ErrRateLimited), errors.Is(e, adobe.ErrDeadUpstream)
+}
+
+const (
+	adobeSubmitBucket3P      = "3p-images"
+	adobeSubmitBucketImageV5 = "image-v5"
+)
+
+func adobeSubmitBucket(modelID string) string {
+	if strings.EqualFold(strings.TrimSpace(modelID), "firefly-image-5") {
+		return adobeSubmitBucketImageV5
+	}
+	return adobeSubmitBucket3P
+}
+
+func adobeSubmitKey(prefix, bucket string) string {
+	return prefix + bucket
+}
+
+func adobeOverloadPause(overloads int) time.Duration {
+	if overloads < adobeOverloadTripThreshold {
+		return 0
+	}
+	shift := overloads - adobeOverloadTripThreshold
+	pause := adobeOverloadBasePause
+	for i := 0; i < shift && pause < adobeOverloadMaxPause; i++ {
+		pause *= 2
+	}
+	if pause > adobeOverloadMaxPause {
+		return adobeOverloadMaxPause
+	}
+	return pause
+}
+
+type adobeSubmitLease struct {
+	finish func(error)
+	cancel func()
+}
+
+func (s *V1Service) acquireAdobeSubmitLease(ctx context.Context, eventID, bucket string) (*adobeSubmitLease, error) {
+	slotsKey := adobeSubmitKey(adobeSubmitSlotsKeyPrefix, bucket)
+	limitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, bucket)
+	successKey := adobeSubmitKey(adobeSubmitSuccessKeyPrefix, bucket)
+	overloadKey := adobeSubmitKey(adobeSubmitOverloadKeyPrefix, bucket)
+	cooldownKey := adobeSubmitKey(adobeSubmitCooldownKeyPrefix, bucket)
+
+	var limit int
+	slotToken := eventID + "-submit-" + randomUpper(8)
+	for {
+		if err := s.conc.WaitWhilePaused(ctx, cooldownKey); err != nil {
+			return nil, err
+		}
+		var err error
+		limit, err = s.conc.AcquireWaitDynamic(ctx, slotsKey, slotToken, adobeSubmitAcquirePoll, func() int {
+			return s.conc.AdaptiveLimit(ctx, limitKey, adobeSubmitInitialConcurrency, adobeSubmitMinConcurrency, adobeSubmitMaxConcurrency, adobeSubmitAdaptiveTTL)
+		})
+		if err != nil {
+			return nil, err
+		}
+		// If a circuit opened while this task was waiting, release and rejoin after
+		// the cooldown so the reduced adaptive limit applies to every queued worker.
+		if s.conc.PauseRemaining(ctx, cooldownKey) > 0 {
+			s.conc.Release(context.WithoutCancel(ctx), slotsKey, slotToken)
+			continue
+		}
+		break
+	}
+
+	acquiredAt := time.Now()
+	var once sync.Once
+	releaseSlot := func(enforceLease bool) {
+		if enforceLease {
+			if remaining := adobeSubmitMinLease - time.Since(acquiredAt); remaining > 0 {
+				time.Sleep(remaining)
+			}
+		}
+		s.conc.Release(context.WithoutCancel(ctx), slotsKey, slotToken)
+	}
+	lease := &adobeSubmitLease{}
+	lease.finish = func(submitErr error) {
+		once.Do(func() {
+			bookkeepingCtx := context.WithoutCancel(ctx)
+			switch {
+			case submitErr == nil:
+				newLimit := s.conc.RecordAdaptiveSuccess(bookkeepingCtx, limitKey, successKey,
+					adobeSubmitInitialConcurrency, adobeSubmitMinConcurrency, adobeSubmitMaxConcurrency,
+					adobeSubmitSuccessesPerIncrease, adobeSubmitAdaptiveTTL)
+				if newLimit > limit {
+					log.Printf("adobe submit admission recovered: bucket=%s limit=%d", bucket, newLimit)
+				}
+			case errors.Is(submitErr, adobe.ErrSubmitOverloaded):
+				newLimit, overloads := s.conc.RecordAdaptiveOverload(bookkeepingCtx, limitKey, successKey, overloadKey,
+					adobeSubmitInitialConcurrency, adobeSubmitMinConcurrency, adobeSubmitMaxConcurrency,
+					adobeOverloadWindow, adobeSubmitAdaptiveTTL)
+				pause := adobeOverloadPause(overloads)
+				if pause > 0 {
+					s.conc.Pause(bookkeepingCtx, cooldownKey, pause)
+				}
+				log.Printf("adobe submit overloaded: bucket=%s window_count=%d limit=%d pause=%s", bucket, overloads, newLimit, pause)
+			}
+			releaseSlot(true)
+		})
+	}
+	lease.cancel = func() {
+		once.Do(func() { releaseSlot(false) })
+	}
+	return lease, nil
+}
+
+func (s *V1Service) adobeSubmitPermit(eventID, bucket string) adobe.SubmitPermit {
+	return func(ctx context.Context) (func(error), error) {
+		lease, err := s.acquireAdobeSubmitLease(ctx, eventID, bucket)
+		if err != nil {
+			return nil, err
+		}
+		return lease.finish, nil
+	}
+}
+
+// primedAdobeSubmitPermit acquires the first submit lease before account
+// selection. Text-to-image bursts therefore queue at the endpoint gate without
+// reserving one Adobe account per waiting goroutine. Failovers and retries
+// acquire subsequent leases normally.
+func (s *V1Service) primedAdobeSubmitPermit(ctx context.Context, eventID, bucket string) (adobe.SubmitPermit, func(), error) {
+	lease, err := s.acquireAdobeSubmitLease(ctx, eventID, bucket)
+	if err != nil {
+		return nil, nil, err
+	}
+	var mu sync.Mutex
+	primed := lease
+	permit := func(acquireCtx context.Context) (func(error), error) {
+		mu.Lock()
+		if primed != nil {
+			current := primed
+			primed = nil
+			mu.Unlock()
+			return current.finish, nil
+		}
+		mu.Unlock()
+		next, acquireErr := s.acquireAdobeSubmitLease(acquireCtx, eventID, bucket)
+		if acquireErr != nil {
+			return nil, acquireErr
+		}
+		return next.finish, nil
+	}
+	cancelUnused := func() {
+		mu.Lock()
+		current := primed
+		primed = nil
+		mu.Unlock()
+		if current != nil {
+			current.cancel()
+		}
+	}
+	return permit, cancelUnused, nil
+}
+
+func waitForAdobeRetry(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func adobeOverloadJitter(eventID string, attempt int) time.Duration {
+	// A small stable hash spreads requests that observed the same overload at the
+	// same instant without introducing shared random-state contention.
+	hash := uint32(2166136261)
+	for i := 0; i < len(eventID); i++ {
+		hash ^= uint32(eventID[i])
+		hash *= 16777619
+	}
+	hash ^= uint32(attempt + 1)
+	return time.Duration(hash%5000) * time.Millisecond
+}
+
+func (s *V1Service) generateAdobeImageWithOverloadRetry(ctx context.Context, eventID string, token model.TokenAccount, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, blobIDs []string, downloadResult bool, permit adobe.SubmitPermit) ([]byte, map[string]any, error) {
+	for attempt := 0; ; attempt++ {
+		data, meta, err := s.adobe.GenerateImageWithSubmitPermit(
+			ctx, token.Value, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, downloadResult,
+			permit,
+		)
+		if !errors.Is(err, adobe.ErrSubmitOverloaded) || attempt >= adobeOverloadRetries {
+			return data, meta, err
+		}
+		delay := adobeOverloadRetryBase*time.Duration(1<<attempt) + adobeOverloadJitter(eventID, attempt)
+		if waitErr := waitForAdobeRetry(ctx, delay); waitErr != nil {
+			return nil, nil, waitErr
+		}
+	}
 }
 
 // creativefabricaErrClass maps a creativefabrica upstream error onto the pool's
@@ -2055,11 +2339,24 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 	if err != nil {
 		return nil, "", err
 	}
+	bucket := adobeSubmitBucket(modelItem.ID)
+	permit := s.adobeSubmitPermit(eventID, bucket)
+	// The common text-to-image path can wait at the endpoint gate before taking
+	// an account slot. Reference uploads need the selected account first, so they
+	// keep the regular just-in-time permit path.
+	if len(refs) == 0 {
+		primedPermit, cancelUnused, primeErr := s.primedAdobeSubmitPermit(ctx, eventID, bucket)
+		if primeErr != nil {
+			return nil, "", primeErr
+		}
+		permit = primedPermit
+		defer cancelUnused()
+	}
 
-	// Round-robin order. Adobe uses tempFailover=true: a temporary upstream error
-	// ("system under load") fails over to the next account without penalizing the
-	// current one, capped at maxTempDeadAccounts; auth/quota also fail over
-	// (see runPoolWithFailover). imageURL is captured from the successful attempt.
+	// Round-robin order. Auth/quota and account-specific temporary errors still
+	// fail over. Adobe submit overload is handled separately by endpoint bucket:
+	// adaptive pacing + delayed same-account retries prevent one request from
+	// sweeping the pool and multiplying pressure.
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "adobe", active, "image", func(token model.TokenAccount) ([]byte, error) {
 		var blobIDs []string
@@ -2077,7 +2374,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 			}
 			blobIDs = append(blobIDs, id)
 		}
-		d, meta, genErr := s.adobe.GenerateImage(ctx, token.Value, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, !urlOnly)
+		d, meta, genErr := s.generateAdobeImageWithOverloadRetry(ctx, eventID, token, modelItem, in, aspectRatio, resolution, blobIDs, !urlOnly, permit)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
 		}

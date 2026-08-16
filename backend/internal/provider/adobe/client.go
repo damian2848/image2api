@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -40,8 +41,12 @@ var (
 	ErrAuth              = errors.New("adobe auth failed")
 	ErrQuotaExhausted    = errors.New("adobe quota exhausted")
 	ErrTemporaryUpstream = errors.New("adobe upstream temporary error")
-	ErrDeadUpstream      = errors.New("adobe upstream fatal error")
-	ErrRateLimited       = errors.New("adobe rate limited")
+	// ErrSubmitOverloaded is Adobe rejecting a generation before returning a
+	// poll URL. It is endpoint admission pressure rather than evidence of an
+	// account failure, so callers should pace instead of fanning out across tokens.
+	ErrSubmitOverloaded = fmt.Errorf("%w: submit system under load", ErrTemporaryUpstream)
+	ErrDeadUpstream     = errors.New("adobe upstream fatal error")
+	ErrRateLimited      = errors.New("adobe rate limited")
 	// ErrContentRejected is Adobe's content-safety filter refusing the prompt or
 	// the generated image (HTTP 451 image_unsafe). It is the prompt's fault, not
 	// the account's — every account rejects the same content — so the caller must
@@ -88,6 +93,11 @@ func isClassifierGlitch(status int, body string) bool {
 		strings.Contains(body, "classification API returned")
 }
 
+func isSystemOverloaded(body string) bool {
+	body = strings.ToLower(body)
+	return strings.Contains(body, "system under load") || strings.Contains(body, "timeout_error")
+}
+
 var profileURLs = []string{
 	"https://ims-na1.adobelogin.com/ims/profile/v1",
 	"https://adobeid-na1.services.adobe.com/ims/profile/v1",
@@ -95,8 +105,16 @@ var profileURLs = []string{
 
 type Client struct {
 	apiKey string
-	proxy  string
+
+	proxyMu sync.RWMutex
+	proxy   string
 }
+
+// SubmitPermit gates only the short generate-async submission phase. The
+// returned finish function receives the submit result as soon as Adobe replies,
+// before polling and downloading. This lets admission control react to accepted
+// submits and overloads without reducing render concurrency.
+type SubmitPermit func(ctx context.Context) (finish func(submitErr error), err error)
 
 func NewClient(apiKey, proxy string) *Client {
 	return &Client{
@@ -113,7 +131,15 @@ func (c *Client) getARPSessionID(token string) string {
 }
 
 func (c *Client) SetProxy(proxy string) {
+	c.proxyMu.Lock()
+	defer c.proxyMu.Unlock()
 	c.proxy = strings.TrimSpace(proxy)
+}
+
+func (c *Client) proxyURL() string {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 func (c *Client) ExchangeCookie(ctx context.Context, cookie string) (*CookieExchangeResult, error) {
@@ -249,6 +275,13 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 }
 
 func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
+	return c.GenerateImageWithSubmitPermit(ctx, token, modelID, prompt, aspectRatio, resolution, blobIDs, downloadResult, nil)
+}
+
+// GenerateImageWithSubmitPermit is GenerateImage with endpoint-scoped admission
+// control around each upstream submit. Polling and result download remain fully
+// concurrent after Adobe accepts the job.
+func (c *Client) GenerateImageWithSubmitPermit(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool, permit SubmitPermit) ([]byte, map[string]any, error) {
 	// Only the generate submit goes through the proxy; polling + download run on
 	// the local IP.
 	submitSess, err := c.newTLSClient()
@@ -273,7 +306,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 		candidates = BuildImagePayloadCandidates(modelID, prompt, aspectRatio, resolution, blobIDs)
 	}
 	for _, payload := range candidates {
-		respBody, pollURL, err := c.submitImage(ctx, submitSess, token, prompt, endpoint, payload)
+		respBody, pollURL, err := c.submitImageWithPermit(ctx, submitSess, token, prompt, endpoint, payload, permit)
 		if err == nil {
 			meta, data, pollErr := c.pollImage(ctx, pollSess, token, pollURL, downloadResult)
 			if pollErr != nil {
@@ -283,6 +316,9 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 		}
 		lastBody = respBody
 		lastErr = err
+		if errors.Is(err, ErrSubmitOverloaded) {
+			return nil, nil, fmt.Errorf("%w: adobe submit: %s", ErrSubmitOverloaded, submitDetail(err, respBody))
+		}
 		if errors.Is(err, ErrAuth) || errors.Is(err, ErrQuotaExhausted) || errors.Is(err, ErrContentRejected) {
 			return nil, nil, err
 		}
@@ -301,6 +337,22 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 		return nil, nil, fmt.Errorf("%w: adobe submit: %s", ErrTemporaryUpstream, submitDetail(lastErr, lastBody))
 	}
 	return nil, nil, fmt.Errorf("adobe submit failed: %s", submitDetail(lastErr, lastBody))
+}
+
+func (c *Client) submitImageWithPermit(ctx context.Context, sess *tlsSession, token, prompt, endpoint string, payload map[string]any, permit SubmitPermit) ([]byte, string, error) {
+	if permit == nil {
+		return c.submitImage(ctx, sess, token, prompt, endpoint, payload)
+	}
+	finish, err := permit(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if finish == nil {
+		finish = func(error) {}
+	}
+	body, pollURL, submitErr := c.submitImage(ctx, sess, token, prompt, endpoint, payload)
+	finish(submitErr)
+	return body, pollURL, submitErr
 }
 
 // submitDetail 拼接上游细节：优先用响应体，响应体为空时（传输层报错，例如超时、
@@ -602,10 +654,11 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		}
 		return respBody, "", fmt.Errorf("%w (submit %d %s: %s)", ErrAuth, resp.StatusCode, accessErr, clip(respBody, 300))
 	}
-	// "system under load" / timeout_error = adobe rate-limit/overload (can come on a
-	// non-5xx) — treat as temporary so the pool retries instead of failing.
-	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
-		return respBody, "", ErrTemporaryUpstream
+	// This is endpoint admission pressure, not evidence that the selected account
+	// is bad. Keep it distinct so the service can pace that endpoint and retry the
+	// same account without sweeping the pool.
+	if isSystemOverloaded(string(respBody)) {
+		return respBody, "", ErrSubmitOverloaded
 	}
 	if isContentRejection(resp.StatusCode, string(respBody)) {
 		return respBody, "", ErrContentRejected
@@ -672,7 +725,7 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 		if readErr != nil {
 			return nil, nil, readErr
 		}
-		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
+		if isSystemOverloaded(string(body)) {
 			return nil, nil, ErrTemporaryUpstream
 		}
 		if isContentRejection(resp.StatusCode, string(body)) {
@@ -810,7 +863,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 	}
 	// "system under load" / timeout_error = adobe overload — treat as a temporary
 	// error so the tempFailover policy moves to the next account (same as the image path).
-	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
+	if isSystemOverloaded(string(respBody)) {
 		return respBody, "", ErrTemporaryUpstream
 	}
 	if resp.StatusCode != 200 {
@@ -875,7 +928,7 @@ func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {
 			return nil, nil, fmt.Errorf("%w (%d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(body, 300))
 		}
-		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
+		if isSystemOverloaded(string(body)) {
 			return nil, nil, ErrTemporaryUpstream
 		}
 		if isContentRejection(resp.StatusCode, string(body)) {
@@ -1072,8 +1125,8 @@ func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, erro
 		tlsclient.WithNotFollowRedirects(),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if useProxy && c.proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxy))
+	if proxy := c.proxyURL(); useProxy && proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 	if err != nil {

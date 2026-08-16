@@ -1,0 +1,213 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
+)
+
+func testConcurrencyService(t *testing.T) (*ConcurrencyService, *miniredis.Miniredis) {
+	t.Helper()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	return NewConcurrencyService(client), server
+}
+
+func TestAdaptiveLimitRecoversAndBacksOff(t *testing.T) {
+	service, redisServer := testConcurrencyService(t)
+	ctx := context.Background()
+	const (
+		limitKey    = "test:limit"
+		successKey  = "test:success"
+		overloadKey = "test:overload"
+	)
+
+	if got := service.AdaptiveLimit(ctx, limitKey, 4, 1, 16, time.Hour); got != 4 {
+		t.Fatalf("initial limit = %d, want 4", got)
+	}
+	for i := 0; i < 19; i++ {
+		if got := service.RecordAdaptiveSuccess(ctx, limitKey, successKey, 4, 1, 16, 20, time.Hour); got != 4 {
+			t.Fatalf("limit after %d successes = %d, want 4", i+1, got)
+		}
+	}
+	if got := service.RecordAdaptiveSuccess(ctx, limitKey, successKey, 4, 1, 16, 20, time.Hour); got != 5 {
+		t.Fatalf("limit after recovery threshold = %d, want 5", got)
+	}
+
+	if limit, count := service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 16, 10*time.Second, time.Hour); limit != 2 || count != 1 {
+		t.Fatalf("first overload = (limit %d, count %d), want (2, 1)", limit, count)
+	}
+	if limit, count := service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 16, 10*time.Second, time.Hour); limit != 1 || count != 2 {
+		t.Fatalf("second overload = (limit %d, count %d), want (1, 2)", limit, count)
+	}
+
+	redisServer.FastForward(11 * time.Second)
+	if _, count := service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 16, 10*time.Second, time.Hour); count != 1 {
+		t.Fatalf("overload count after window = %d, want 1", count)
+	}
+}
+
+func TestAdobeSubmitBucketsAreIndependent(t *testing.T) {
+	service, _ := testConcurrencyService(t)
+	v1 := &V1Service{conc: service}
+	ctx := context.Background()
+
+	threePLimitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, adobeSubmitBucket3P)
+	imageV5LimitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, adobeSubmitBucketImageV5)
+	if err := service.redis.Set(ctx, threePLimitKey, 1, time.Hour).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.redis.Set(ctx, imageV5LimitKey, 1, time.Hour).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := v1.acquireAdobeSubmitLease(ctx, "evt-first", adobeSubmitBucket3P)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.cancel()
+
+	timedCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancel()
+	if _, err := v1.acquireAdobeSubmitLease(timedCtx, "evt-blocked", adobeSubmitBucket3P); err == nil {
+		t.Fatal("second 3p-images lease should wait for the occupied bucket")
+	}
+
+	imageV5, err := v1.acquireAdobeSubmitLease(ctx, "evt-image-v5", adobeSubmitBucketImageV5)
+	if err != nil {
+		t.Fatalf("image-v5 bucket should remain independent: %v", err)
+	}
+	imageV5.cancel()
+}
+
+func TestAdobePrimedPermitCancelReleasesUnusedLease(t *testing.T) {
+	service, _ := testConcurrencyService(t)
+	v1 := &V1Service{conc: service}
+	ctx := context.Background()
+	limitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, adobeSubmitBucket3P)
+	if err := service.redis.Set(ctx, limitKey, 1, time.Hour).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, cancelUnused, err := v1.primedAdobeSubmitPermit(ctx, "evt-primed", adobeSubmitBucket3P)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelUnused()
+
+	nextCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	next, err := v1.acquireAdobeSubmitLease(nextCtx, "evt-next", adobeSubmitBucket3P)
+	if err != nil {
+		t.Fatalf("unused primed lease was not released: %v", err)
+	}
+	next.cancel()
+}
+
+func TestAdobeSubmitGateBoundsTwentyRequestBurst(t *testing.T) {
+	service, _ := testConcurrencyService(t)
+	v1 := &V1Service{conc: service}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var active atomic.Int32
+	var maximum atomic.Int32
+	var group sync.WaitGroup
+	errors := make(chan error, 20)
+	for i := 0; i < 20; i++ {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			lease, err := v1.acquireAdobeSubmitLease(ctx, fmt.Sprintf("evt-%02d", index), adobeSubmitBucket3P)
+			if err != nil {
+				errors <- err
+				return
+			}
+			current := active.Add(1)
+			for {
+				seen := maximum.Load()
+				if current <= seen || maximum.CompareAndSwap(seen, current) {
+					break
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+			active.Add(-1)
+			lease.cancel()
+		}(i)
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		t.Fatalf("burst admission failed: %v", err)
+	}
+	if got := maximum.Load(); got > adobeSubmitInitialConcurrency {
+		t.Fatalf("maximum simultaneous leases = %d, want <= %d", got, adobeSubmitInitialConcurrency)
+	}
+	if got := maximum.Load(); got < 2 {
+		t.Fatalf("burst did not exercise concurrency: maximum = %d", got)
+	}
+}
+
+func TestQueuedAdobeSubmitHonorsReducedLimit(t *testing.T) {
+	service, _ := testConcurrencyService(t)
+	v1 := &V1Service{conc: service}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	leases := make([]*adobeSubmitLease, 0, adobeSubmitInitialConcurrency)
+	for i := 0; i < adobeSubmitInitialConcurrency; i++ {
+		lease, err := v1.acquireAdobeSubmitLease(ctx, fmt.Sprintf("evt-held-%d", i), adobeSubmitBucket3P)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leases = append(leases, lease)
+	}
+
+	acquired := make(chan *adobeSubmitLease, 1)
+	failed := make(chan error, 1)
+	go func() {
+		lease, err := v1.acquireAdobeSubmitLease(ctx, "evt-queued", adobeSubmitBucket3P)
+		if err != nil {
+			failed <- err
+			return
+		}
+		acquired <- lease
+	}()
+
+	limitKey := adobeSubmitKey(adobeSubmitLimitKeyPrefix, adobeSubmitBucket3P)
+	successKey := adobeSubmitKey(adobeSubmitSuccessKeyPrefix, adobeSubmitBucket3P)
+	overloadKey := adobeSubmitKey(adobeSubmitOverloadKeyPrefix, adobeSubmitBucket3P)
+	service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 16, 10*time.Second, time.Hour)
+	service.RecordAdaptiveOverload(ctx, limitKey, successKey, overloadKey, 4, 1, 16, 10*time.Second, time.Hour)
+
+	// Releasing one of four live leases still leaves three active, above the new
+	// limit of one. A queued worker must not enter using the old limit of four.
+	leases[0].cancel()
+	select {
+	case lease := <-acquired:
+		lease.cancel()
+		t.Fatal("queued worker ignored the reduced adaptive limit")
+	case err := <-failed:
+		t.Fatalf("queued worker failed early: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	for _, lease := range leases[1:] {
+		lease.cancel()
+	}
+	select {
+	case lease := <-acquired:
+		lease.cancel()
+	case err := <-failed:
+		t.Fatalf("queued worker failed after capacity was released: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("queued worker did not enter at the reduced limit")
+	}
+}

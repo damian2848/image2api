@@ -108,9 +108,18 @@ function fmtWhen(ts) {
 // to the muted <video> preview for those.
 const thumbFail = reactive({})
 
-const previewing = ref(null)   // entry whose generated file is open in the lightbox
-const previewFile = (e) => e.preview_file || e.file || ''
-const hasPreview = (e) => e.status === 'success' && !!previewFile(e)
+const previewing = ref(null)   // entry whose media is open in the lightbox
+// A failed image event's private preview is its first reference image. For a
+// successful stored request, File is the generated result; API requests use a
+// saved result copy in PreviewFile because File can be an upstream URL.
+const previewFile = (e) => {
+  if (e.status === 'success') {
+    const isApi = e.source === 'v1' || e.source === 'v1_async'
+    return isApi ? (e.preview_file || e.file || '') : (e.file || e.preview_file || '')
+  }
+  return e.preview_file || ''
+}
+const hasPreview = (e) => (e.status === 'success' || e.status === 'failed') && !!previewFile(e)
 function openPreview(e) {
   if (!hasPreview(e)) return
   previewing.value = e
@@ -277,8 +286,6 @@ const callPort = (e) => Number(e.request_port) > 0 ? String(e.request_port) : '�
               <div v-else-if="e.status === 'pending'" class="w-12 h-12 mx-auto rounded-lg bg-amber-500/10 ring-1 ring-amber-400/30 grid place-items-center">
                 <span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span>
               </div>
-              <!-- failed (and any non-success/non-pending) rows: no thumbnail, just a dash.
-                   The 状态 column already flags the failure. -->
               <span v-else class="text-white/20">—</span>
             </td>
             <td class="px-4 py-3.5 align-middle text-xs whitespace-nowrap" :title="fmtTs(e.ts)">

@@ -55,6 +55,66 @@ func (c *ConcurrencyService) Acquire(ctx context.Context, key string, max int, t
 	return res == 1
 }
 
+// AcquireWait waits for a slot instead of rejecting a burst. It is used by
+// provider admission control, where queueing a submit is preferable to sending
+// another request into an already saturated upstream. Redis failures still
+// fail open through Acquire.
+func (c *ConcurrencyService) AcquireWait(ctx context.Context, key string, max int, token string, pollEvery time.Duration) error {
+	if pollEvery <= 0 {
+		pollEvery = 100 * time.Millisecond
+	}
+	for {
+		if c.Acquire(ctx, key, max, token) {
+			return nil
+		}
+		timer := time.NewTimer(pollEvery)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// AcquireWaitDynamic is AcquireWait with a limit that is re-read on every
+// admission attempt. Adaptive provider gates use it so already queued workers
+// immediately honor a concurrency decrease after an overload response.
+func (c *ConcurrencyService) AcquireWaitDynamic(ctx context.Context, key, token string, pollEvery time.Duration, limit func() int) (int, error) {
+	if pollEvery <= 0 {
+		pollEvery = 100 * time.Millisecond
+	}
+	for {
+		current := 1
+		if limit != nil {
+			current = limit()
+		}
+		if current < 1 {
+			current = 1
+		}
+		if c.Acquire(ctx, key, current, token) {
+			return current, nil
+		}
+		timer := time.NewTimer(pollEvery)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 // Release frees the slot held by `token` under `key`. Safe to call even if the
 // slot already expired.
 func (c *ConcurrencyService) Release(ctx context.Context, key, token string) {
@@ -62,6 +122,193 @@ func (c *ConcurrencyService) Release(ctx context.Context, key, token string) {
 		return
 	}
 	_ = c.redis.ZRem(ctx, key, token).Err()
+}
+
+// pauseScript extends a shared cooldown without allowing a shorter concurrent
+// pause to reduce an already longer one. KEYS[1]=key, ARGV[1]=duration ms.
+var pauseScript = redis.NewScript(`
+local requested = tonumber(ARGV[1])
+local current = redis.call('PTTL', KEYS[1])
+if current < requested then
+  redis.call('SET', KEYS[1], '1', 'PX', requested)
+end
+return 1
+`)
+
+// Pause starts or extends a provider-wide cooldown. It is best-effort: an
+// unavailable Redis must not turn an upstream error into a local outage.
+func (c *ConcurrencyService) Pause(ctx context.Context, key string, duration time.Duration) {
+	if c == nil || c.redis == nil || duration <= 0 {
+		return
+	}
+	_ = pauseScript.Run(ctx, c.redis, []string{key}, duration.Milliseconds()).Err()
+}
+
+// PauseRemaining returns the current shared cooldown without waiting.
+func (c *ConcurrencyService) PauseRemaining(ctx context.Context, key string) time.Duration {
+	if c == nil || c.redis == nil {
+		return 0
+	}
+	remaining, err := c.redis.PTTL(ctx, key).Result()
+	if err != nil || remaining <= 0 {
+		return 0
+	}
+	return remaining
+}
+
+// WaitWhilePaused blocks until a shared cooldown expires. It rechecks the TTL
+// after every wake because another overload response may extend the pause.
+func (c *ConcurrencyService) WaitWhilePaused(ctx context.Context, key string) error {
+	for {
+		remaining := c.PauseRemaining(ctx, key)
+		if remaining <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// adaptiveLimitScript returns a bounded distributed limit, initializing it on
+// first use. The state expires after an idle period so a deployment or a long
+// quiet interval returns to the conservative initial value.
+var adaptiveLimitScript = redis.NewScript(`
+local initial = tonumber(ARGV[1])
+local minimum = tonumber(ARGV[2])
+local maximum = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+local current = tonumber(redis.call('GET', KEYS[1]))
+if not current then current = initial end
+if current < minimum then current = minimum end
+if current > maximum then current = maximum end
+redis.call('SET', KEYS[1], current, 'PX', ttl)
+return current
+`)
+
+// adaptiveSuccessScript implements additive recovery: every N accepted submits
+// increases the bucket limit by one, up to the configured maximum.
+var adaptiveSuccessScript = redis.NewScript(`
+local initial = tonumber(ARGV[1])
+local minimum = tonumber(ARGV[2])
+local maximum = tonumber(ARGV[3])
+local threshold = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+local current = tonumber(redis.call('GET', KEYS[1]))
+if not current then current = initial end
+if current < minimum then current = minimum end
+if current > maximum then current = maximum end
+local successes = redis.call('INCR', KEYS[2])
+redis.call('PEXPIRE', KEYS[2], ttl)
+if successes >= threshold then
+  redis.call('DEL', KEYS[2])
+  if current < maximum then current = current + 1 end
+end
+redis.call('SET', KEYS[1], current, 'PX', ttl)
+return current
+`)
+
+// adaptiveOverloadScript applies multiplicative decrease and counts overloads
+// in a short fixed window. The caller uses the count to decide whether this is
+// an isolated response or enough correlated pressure to open a circuit.
+var adaptiveOverloadScript = redis.NewScript(`
+local initial = tonumber(ARGV[1])
+local minimum = tonumber(ARGV[2])
+local maximum = tonumber(ARGV[3])
+local window = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+local current = tonumber(redis.call('GET', KEYS[1]))
+if not current then current = initial end
+if current < minimum then current = minimum end
+if current > maximum then current = maximum end
+current = math.floor(current / 2)
+if current < minimum then current = minimum end
+redis.call('SET', KEYS[1], current, 'PX', ttl)
+redis.call('DEL', KEYS[2])
+local overloads = redis.call('INCR', KEYS[3])
+if overloads == 1 then redis.call('PEXPIRE', KEYS[3], window) end
+return {current, overloads}
+`)
+
+func normalizeAdaptiveBounds(initial, minimum, maximum int) (int, int, int) {
+	if minimum < 1 {
+		minimum = 1
+	}
+	if maximum < minimum {
+		maximum = minimum
+	}
+	if initial < minimum {
+		initial = minimum
+	}
+	if initial > maximum {
+		initial = maximum
+	}
+	return initial, minimum, maximum
+}
+
+// AdaptiveLimit returns the current shared limit for a provider bucket.
+func (c *ConcurrencyService) AdaptiveLimit(ctx context.Context, key string, initial, minimum, maximum int, ttl time.Duration) int {
+	initial, minimum, maximum = normalizeAdaptiveBounds(initial, minimum, maximum)
+	if c == nil || c.redis == nil {
+		return initial
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	limit, err := adaptiveLimitScript.Run(ctx, c.redis, []string{key}, initial, minimum, maximum, ttl.Milliseconds()).Int()
+	if err != nil {
+		return initial
+	}
+	return limit
+}
+
+// RecordAdaptiveSuccess records an accepted submit and performs additive
+// recovery after successesPerIncrease consecutive accepts.
+func (c *ConcurrencyService) RecordAdaptiveSuccess(ctx context.Context, limitKey, successKey string, initial, minimum, maximum, successesPerIncrease int, ttl time.Duration) int {
+	initial, minimum, maximum = normalizeAdaptiveBounds(initial, minimum, maximum)
+	if successesPerIncrease < 1 {
+		successesPerIncrease = 1
+	}
+	if c == nil || c.redis == nil {
+		return initial
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	limit, err := adaptiveSuccessScript.Run(ctx, c.redis, []string{limitKey, successKey}, initial, minimum, maximum, successesPerIncrease, ttl.Milliseconds()).Int()
+	if err != nil {
+		return initial
+	}
+	return limit
+}
+
+// RecordAdaptiveOverload halves the current bucket limit and returns both the
+// new limit and the number of overloads observed inside the current window.
+func (c *ConcurrencyService) RecordAdaptiveOverload(ctx context.Context, limitKey, successKey, overloadKey string, initial, minimum, maximum int, window, ttl time.Duration) (int, int) {
+	initial, minimum, maximum = normalizeAdaptiveBounds(initial, minimum, maximum)
+	if c == nil || c.redis == nil {
+		return initial, 1
+	}
+	if window <= 0 {
+		window = 10 * time.Second
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	values, err := adaptiveOverloadScript.Run(ctx, c.redis, []string{limitKey, successKey, overloadKey}, initial, minimum, maximum, window.Milliseconds(), ttl.Milliseconds()).Int64Slice()
+	if err != nil || len(values) != 2 {
+		return initial, 1
+	}
+	return int(values[0]), int(values[1])
 }
 
 // Count returns the live (non-expired) slot count under `key` — for display.

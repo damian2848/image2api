@@ -24,8 +24,17 @@ const search = ref('')
 const page = ref(1)
 const pageSize = 20
 const lightbox = ref(null)
-const previewFile = (e) => e.preview_file || e.file || ''
-const hasPreview = (e) => e.status === 'success' && !!previewFile(e)
+// Failed image events retain their first reference image in PreviewFile.
+// Successful stored requests use File; API requests use the saved result copy
+// because their File value can be an upstream URL rather than a storage key.
+const previewFile = (e) => {
+  if (e.status === 'success') {
+    const isApi = e.source === 'v1' || e.source === 'v1_async'
+    return isApi ? (e.preview_file || e.file || '') : (e.file || e.preview_file || '')
+  }
+  return e.preview_file || ''
+}
+const hasPreview = (e) => (e.status === 'success' || e.status === 'failed') && !!previewFile(e)
 // Video rows whose first-frame thumbnail is missing (old videos) — fall back
 // to the muted <video> preview for those.
 const thumbFail = reactive({})

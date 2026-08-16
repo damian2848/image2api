@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/base64"
 	"net/netip"
 	"testing"
 	"time"
@@ -125,5 +126,22 @@ func TestIsPublicReferenceIP(t *testing.T) {
 				t.Fatalf("isPublicReferenceIP(%s) = %t, want %t", tt.ip, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPreviewReferenceImageUsesFirstDecodableImage(t *testing.T) {
+	// A valid 1x1 GIF. The invalid prefix verifies that one malformed input
+	// doesn't prevent a later reference image from becoming the failure preview.
+	gif := "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+	want, err := base64.StdEncoding.DecodeString(gif)
+	if err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	got, thumbnail := previewReferenceImage([]string{"not-base64", gif})
+	if string(got) != string(want) {
+		t.Fatalf("previewReferenceImage returned the wrong reference image")
+	}
+	if len(thumbnail) == 0 {
+		t.Fatal("previewReferenceImage did not create a thumbnail")
 	}
 }
