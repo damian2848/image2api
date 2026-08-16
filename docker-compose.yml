@@ -108,9 +108,10 @@ services:
     build:
       context: ./frontend
     # nginx serves the SPA + proxies the API on container port 2000 (HTTP only).
-    # Point your own reverse proxy at host:2000.
+    # Point your own reverse proxy at host:2000. Bind to 0.0.0.0 only when
+    # intentionally exposing this development endpoint without a host proxy.
     ports:
-      - "2000:2000"
+      - "${WEB_BIND_HOST:-127.0.0.1}:${WEB_PORT:-2000}:2000"
     depends_on:
       - backend
     restart: unless-stopped

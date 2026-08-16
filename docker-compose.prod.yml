@@ -1,6 +1,7 @@
 # image2api — production stack on the new server.
 # PostgreSQL + Redis + RustFS (S3) + backend + frontend/nginx (HTTP on port 80).
 # TLS is handled externally (CDN/reverse proxy); this stack is plain HTTP.
+# Set IMAGE_PUBLIC_ORIGIN to that exact HTTPS origin before deployment.
 #
 # Usage:
 #   docker compose -f docker-compose.prod.yml up -d --build
@@ -80,8 +81,8 @@ services:
       RUSTFS_BUCKET: vivid
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-vividai}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-vividai_secret_2026}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://vividai.run,http://www.vividai.run,http://206.168.190.183}
-      COOKIE_SECURE: "false"
+      CORS_ORIGINS: ${IMAGE_PUBLIC_ORIGIN:?IMAGE_PUBLIC_ORIGIN must be set to the public HTTPS origin}
+      COOKIE_SECURE: "true"
     volumes:
       - generated:/app/data/generated
     depends_on:

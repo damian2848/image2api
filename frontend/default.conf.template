@@ -1,6 +1,13 @@
 # nginx for the docker stack — HTTP only on :2000. TLS + domain are handled by
 # the user's OWN reverse proxy placed in front of this container; this just serves
 # the SPA and reverse-proxies the API to the backend.
+# Preserve the externally terminated protocol so the backend generates HTTPS
+# callback and media URLs. For direct HTTP access, fall back to this nginx hop.
+map $http_x_forwarded_proto $public_forwarded_proto {
+    ""      $scheme;
+    default $http_x_forwarded_proto;
+}
+
 server {
     listen 2000;
     listen [::]:2000;
@@ -14,7 +21,7 @@ server {
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Proto $public_forwarded_proto;
 
     # video / large-image generation can block minutes — avoid the 60s 504.
     proxy_connect_timeout 600s;
