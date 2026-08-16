@@ -63,7 +63,7 @@ const taskKey = (x) => [x.model, x.kind, (x.prompt || '').trim()].join('|')
 // Up to 10 cards (一行五个 × 2): in-session tasks first, then the server's recent
 // rows (进行中 + 成功) so the grid stays filled; loadHistory() prunes an optimistic
 // task once the server tracks it → never a duplicate. 新的顶掉老的.
-const displayItems = computed(() => [...tasks.value, ...history.value].slice(0, 10))
+const displayItems = computed(() => [...tasks.value, ...history.value].slice(0, 12))
 
 // ---- derived ----
 const models = computed(() =>
@@ -124,6 +124,22 @@ const refModeDefault = computed(() => familyPreset.value?.reference_mode || mode
 const supportsBoth = computed(() => { const m = model.value; return m && m.reference_mode === 'style' && (m.max_reference_images || 0) >= 2 })
 const refMode = ref(refModeDefault.value)
 watch(refModeDefault, (v) => { refMode.value = v })
+
+// 预设里声明的音/视频参考上限（未声明 = null，走 seedance 默认值）
+const maxVideosRaw = computed(() => {
+  const n = familyPreset.value?.max_videos
+  return n === undefined || n === null ? null : Number(n)
+})
+const maxAudiosRaw = computed(() => {
+  const n = familyPreset.value?.max_audios
+  return n === undefined || n === null ? null : Number(n)
+})
+// creativefabrica 上游只收图片参考,没有首尾帧/视频/音频,虽叫 seedance 也要排除。
+const isSeedanceModel = computed(() =>
+  /^seedance/.test(model.value?.id || '') && (model.value?.provider || '') !== 'creativefabrica')
+// 支持图片以外的参考资产（视频/音频）的模型：seedance 系 + 预设声明了音视频上限的
+const supportsMediaRefs = computed(() =>
+  isSeedanceModel.value || maxVideosRaw.value > 0 || maxAudiosRaw.value > 0)
 
 const perSecondRate = computed(() => {
   if (mode.value !== 'video' || !model.value) return null
@@ -217,28 +233,93 @@ function openPicker() { fileInput.value && fileInput.value.click() }
 // here at pick time so an oversized image fails fast with a clear message instead
 // of charging + failing upstream after the upload.
 const MAX_REF_BYTES = 20 * 1024 * 1024
-const fileAccept = computed(() => 'image/*')
+// seedance 参考图模式各类上限（预设可覆盖：Leonardo 私有 seedance 只吃 1 段音频）
+const maxImages = computed(() => Number(familyPreset.value?.max_images) || maxRefs.value)
+const maxVideos = computed(() => (maxVideosRaw.value === null ? 3 : maxVideosRaw.value))
+const maxAudios = computed(() => (maxAudiosRaw.value === null ? 3 : maxAudiosRaw.value))
+// Leonardo 私有 seedance：单个视频参考 3-10 秒，总时长须短于 15 秒。
+// 服务端同样校验，这里只是提交前先拦一下，避免白跑一次生成。
+function videoRefDurationError() {
+  if (mode.value !== 'video' || familyPreset.value?.provider !== 'leonardo') return ''
+  const vids = refImages.value.filter((r) => r.fileType === 'video')
+  for (const v of vids) {
+    if (v.duration && (v.duration < 3 || v.duration > 10))
+      return `单个视频参考需 3-10 秒：${v.name} 为 ${v.duration.toFixed(1)} 秒`
+  }
+  const vTotal = vids.reduce((n, v) => n + (v.duration || 0), 0)
+  if (vids.length && vTotal >= 15) return `视频参考总时长 ${vTotal.toFixed(1)} 秒，需短于 15 秒`
+  const audioLimit = Number(familyPreset.value?.max_audio_seconds) || 0
+  if (audioLimit > 0) {
+    const aTotal = refImages.value
+      .filter((r) => r.fileType === 'audio')
+      .reduce((n, a) => n + (a.duration || 0), 0)
+    if (aTotal > audioLimit)
+      return `音频参考总时长 ${aTotal.toFixed(1)} 秒，最多 ${audioLimit} 秒`
+  }
+  return ''
+}
+
+// seedance 参考图（非首尾帧）模式下允许图片/视频/音频
+const fileAccept = computed(() => {
+  if (supportsMediaRefs.value && refMode.value !== 'frame' && mode.value === 'video')
+    return 'image/*,video/*,audio/*'
+  return 'image/*'
+})
+
+// 当前各类文件数量
+const refCounts = computed(() => {
+  const imgs = refImages.value.filter(f => !f.fileType || f.fileType === 'image').length
+  const vids = refImages.value.filter(f => f.fileType === 'video').length
+  const auds = refImages.value.filter(f => f.fileType === 'audio').length
+  return { imgs, vids, auds }
+})
 
 function onFiles(ev) {
   addFiles(Array.from(ev.target.files || []))
   if (ev.target) ev.target.value = ''
 }
-// Shared by the file picker AND drag-and-drop. Honors the per-model max +
-// 20MB cap.
+// Shared by the file picker AND drag-and-drop. Honors per-model max + per-type
+// limits (image/video/audio) + 20MB cap.
 function addFiles(files) {
+  const allowMedia = supportsMediaRefs.value && refMode.value !== 'frame' && mode.value === 'video'
   const tooBig = []
   for (const f of files) {
     if (!f || !f.type) continue
     const isImage = f.type.startsWith('image/')
-    if (!isImage) continue
+    const isVideo = f.type.startsWith('video/')
+    const isAudio = f.type.startsWith('audio/')
+    if (!isImage && !(allowMedia && (isVideo || isAudio))) continue
     if (refImages.value.length >= maxRefs.value) break
     if (f.size > MAX_REF_BYTES) { tooBig.push(f.name); continue }
-    makeThumb(f).then((thumb) => {
-      if (thumb) { refImages.value.push({ name: f.name, file: f, thumb, fileType: 'image' }); return }
-      const reader = new FileReader()
-      reader.onload = () => refImages.value.push({ name: f.name, file: f, dataUrl: reader.result, fileType: 'image' })
-      reader.readAsDataURL(f)
-    })
+    const { imgs, vids, auds } = refCounts.value
+    if (isVideo && vids >= maxVideos.value) continue
+    if (isAudio && auds >= maxAudios.value) continue
+    if (isImage && allowMedia && imgs >= maxImages.value) continue
+    const fileType = isVideo ? 'video' : isAudio ? 'audio' : 'image'
+    if (isImage) {
+      makeThumb(f).then((thumb) => {
+        if (thumb) { refImages.value.push({ name: f.name, file: f, thumb, fileType: 'image' }); return }
+        const reader = new FileReader()
+        reader.onload = () => refImages.value.push({ name: f.name, file: f, dataUrl: reader.result, fileType: 'image' })
+        reader.readAsDataURL(f)
+      })
+    } else if (isVideo) {
+      // 视频：截首帧当缩略图 + 记录时长
+      const mediaUrl = URL.createObjectURL(f)
+      makeVideoThumb(mediaUrl).then(({ thumb, duration }) => {
+        refImages.value.push({ name: f.name, file: f, fileType, thumb, duration, mediaUrl })
+      })
+    } else {
+      // 音频：objectURL 用于内联播放，metadata 拿时长
+      const mediaUrl = URL.createObjectURL(f)
+      const a = new Audio()
+      a.preload = 'metadata'
+      a.onloadedmetadata = () => {
+        refImages.value.push({ name: f.name, file: f, fileType, mediaUrl, duration: a.duration })
+      }
+      a.onerror = () => refImages.value.push({ name: f.name, file: f, fileType, mediaUrl })
+      a.src = mediaUrl
+    }
   }
   error.value = tooBig.length
     ? `文件超过 20MB 已跳过：${tooBig.join('、')}（请压缩后再传）`
@@ -296,6 +377,7 @@ function onDragLeave(ev) {
   dragOver.value = false
 }
 function clearRefs() {
+  stopAudio()
   for (const r of refImages.value) if (r.mediaUrl) URL.revokeObjectURL(r.mediaUrl)
   refImages.value = []
 }
@@ -303,7 +385,56 @@ function removeRef(r) {
   const i = refImages.value.indexOf(r)
   if (i < 0) return
   if (r.mediaUrl) URL.revokeObjectURL(r.mediaUrl)
+  if (r === playingAudio.value) stopAudio()
   refImages.value.splice(i, 1)
+}
+
+// 参考区分两块渲染：图片/视频走方块缩略图，音频单独一行（可播放条）。
+const tileRefs = computed(() => refImages.value.filter((r) => r.fileType !== 'audio'))
+const audioRefs = computed(() => refImages.value.filter((r) => r.fileType === 'audio'))
+
+// mm:ss
+function fmtDur(s) {
+  if (!isFinite(s) || s <= 0) return ''
+  const n = Math.round(s)
+  return `${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}`
+}
+
+// 音频内联播放：同一时间只播一条，用一个共享 <audio> 元素。
+const playingAudio = ref(null)
+const audioEl = new Audio()
+audioEl.onended = () => { playingAudio.value = null }
+function stopAudio() {
+  audioEl.pause()
+  playingAudio.value = null
+}
+function toggleAudio(r) {
+  if (playingAudio.value === r) { stopAudio(); return }
+  audioEl.src = r.mediaUrl
+  audioEl.play().catch(() => {})
+  playingAudio.value = r
+}
+
+// 截视频首帧做缩略图（objectURL 同源，canvas 不会 taint）。
+function makeVideoThumb(url, maxSide = 320) {
+  return new Promise((resolve) => {
+    const v = document.createElement('video')
+    v.muted = true
+    v.preload = 'auto'
+    v.src = url
+    const done = (thumb) => resolve({ thumb, duration: v.duration })
+    v.addEventListener('loadeddata', () => {
+      try {
+        const scale = Math.min(1, maxSide / Math.max(v.videoWidth, v.videoHeight))
+        const c = document.createElement('canvas')
+        c.width = Math.max(1, Math.round(v.videoWidth * scale))
+        c.height = Math.max(1, Math.round(v.videoHeight * scale))
+        c.getContext('2d').drawImage(v, 0, 0, c.width, c.height)
+        done(c.toDataURL('image/jpeg', 0.8))
+      } catch { done('') }
+    })
+    v.addEventListener('error', () => done(''))
+  })
 }
 
 // Re-hydrate reference thumbnails from server URLs (after a reload). Fetches
@@ -405,6 +536,8 @@ async function run() {
     error.value = '该视频模型需要至少 1 张参考图 (首帧)'
     return
   }
+  const refErr = videoRefDurationError()
+  if (refErr) { error.value = refErr; return }
   if (price.value == null) {
     error.value = '该参数组合未定价 (留空 = 不支持)'
     return
@@ -444,7 +577,7 @@ async function fireOne() {
   const refsSnapshot = refImages.value.slice()
   const chargedPrice = price.value
   tasks.value.unshift(task)
-  if (tasks.value.length > 10) tasks.value = tasks.value.slice(0, 10)
+  if (tasks.value.length > 12) tasks.value = tasks.value.slice(0, 12)
 
   // Optimistically deduct the price (server debits before generating; a failure
   // refunds + refreshMe reconciles).
@@ -673,6 +806,7 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKey)
   clearInterval(pollTimer)
+  stopAudio()
   for (const r of refImages.value) if (r.mediaUrl) URL.revokeObjectURL(r.mediaUrl)
 })
 </script>
@@ -779,7 +913,7 @@ onUnmounted(() => {
         <label class="block text-xs font-medium text-slate-500 mb-1.5">
           {{ refMode === 'frame' && mode === 'video' ? '首尾帧' : '参考图' }}
           <span class="text-slate-400 font-normal">
-            (最多 {{ maxRefs }} 张{{ refMode === 'frame' && mode === 'video' ? (maxRefs >= 2 ? ' · 首帧/末帧' : ' · 首帧') : '' }} · 单文件 ≤20MB)
+            (最多 {{ maxRefs }} 张{{ supportsMediaRefs && refMode !== 'frame' && mode === 'video' ? ` · 图片${refCounts.imgs}/${maxImages} · 视频${refCounts.vids}/${maxVideos} · 音频${refCounts.auds}/${maxAudios}` : '' }}{{ refMode === 'frame' && mode === 'video' ? (maxRefs >= 2 ? ' · 首帧/末帧' : ' · 首帧') : '' }} · 单文件 ≤20MB)
           </span>
           <span v-if="refsRequired" class="text-rose-500">*</span>
         </label>
@@ -795,9 +929,20 @@ onUnmounted(() => {
         <div class="flex gap-2 flex-wrap items-start rounded-lg transition-colors"
              :class="dragOver ? 'ring-2 ring-indigo-400 ring-offset-2 bg-indigo-50/40' : ''"
              @drop="onDrop" @dragover="onDragOver" @dragleave="onDragLeave">
-          <div v-for="(img, i) in refImages" :key="img.mediaUrl || img.url || img.name + i"
+          <div v-for="(img, i) in tileRefs" :key="img.mediaUrl || img.url || img.name + i"
                class="relative w-20 h-20 rounded-lg overflow-hidden border border-slate-200 bg-slate-50 transition-all">
-            <img :src="img.thumb || img.dataUrl || img.url" class="w-full h-full object-cover" />
+            <!-- 图片预览 -->
+            <img v-if="!img.fileType || img.fileType === 'image'" :src="img.thumb || img.dataUrl || img.url" class="w-full h-full object-cover" />
+            <!-- 视频预览：首帧缩略图 + "视频"角标，无缩略图时退回图标 -->
+            <template v-else-if="img.fileType === 'video'">
+              <img v-if="img.thumb" :src="img.thumb" class="w-full h-full object-cover" />
+              <div v-else class="w-full h-full grid place-items-center bg-slate-800 text-white">
+                <Icon name="video" class="w-6 h-6 opacity-80" />
+              </div>
+              <span class="absolute top-1 left-1 rounded bg-slate-900/70 text-white text-[9px] px-1 py-0.5">
+                视频
+              </span>
+            </template>
             <button type="button" @click="removeRef(img)"
                     class="absolute top-1 right-1 w-5 h-5 rounded-full bg-slate-900/70 text-white hover:bg-rose-500 grid place-items-center disabled:opacity-40 disabled:cursor-not-allowed">
               <Icon name="close" class="w-3 h-3" />
@@ -812,6 +957,24 @@ onUnmounted(() => {
                   :title="dragOver ? '松开以添加' : '点击或拖拽图片到此'">
             <Icon :name="dragOver ? 'download' : 'plus'" class="w-5 h-5" />
           </button>
+        </div>
+        <!-- 音频：单独一行可播放条 -->
+        <div v-if="audioRefs.length" class="mt-2 space-y-1.5">
+          <div v-for="a in audioRefs" :key="a.mediaUrl"
+               class="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5">
+            <button type="button" @click="toggleAudio(a)" :title="playingAudio === a ? '暂停' : '播放'"
+                    class="w-7 h-7 shrink-0 rounded-full grid place-items-center transition-colors"
+                    :class="playingAudio === a ? 'chip-on' : 'bg-slate-200 text-slate-600 hover:bg-slate-300'">
+              <Icon :name="playingAudio === a ? 'pause' : 'play'" class="w-3 h-3" />
+            </button>
+            <Icon name="music" class="w-3.5 h-3.5 shrink-0 text-slate-400" />
+            <span class="flex-1 min-w-0 truncate text-xs text-slate-600">{{ a.name }}</span>
+            <span v-if="fmtDur(a.duration)" class="text-[10px] tabular-nums text-slate-400 shrink-0">{{ fmtDur(a.duration) }}</span>
+            <button type="button" @click="removeRef(a)" title="移除"
+                    class="w-5 h-5 shrink-0 rounded-full text-slate-400 hover:text-rose-500 grid place-items-center">
+              <Icon name="close" class="w-3 h-3" />
+            </button>
+          </div>
         </div>
         <input ref="fileInput" type="file" :accept="fileAccept" multiple class="hidden" @change="onFiles" />
       </div>
@@ -847,7 +1010,7 @@ onUnmounted(() => {
          10 with the user's recent results. No lock: 生成 can be clicked anytime.
          min-w-0 keeps a long prompt from blowing the 1fr track wider than the page. -->
     <div class="min-w-0">
-      <div v-if="displayItems.length" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+      <div v-if="displayItems.length" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
         <div v-for="item in displayItems" :key="item.id"
              class="group relative rounded-xl overflow-hidden ring-1 ring-slate-200 bg-slate-100 aspect-[4/5]">
           <!-- done: media + caption -->

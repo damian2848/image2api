@@ -28,7 +28,7 @@ const (
 	fireflyVideoSubmitURL = "https://video-v1.ff.adobe.io/v2/videos/generate"
 	fireflyVideoUploadURL = "https://video-v1.ff.adobe.io/v2/storage/image"
 	uploadURL             = "https://firefly-3p.ff.adobe.io/v2/storage/image"
-	// Reference video/audio go to their own storage endpoints; posting
+	// Seedance reference video/audio go to their own storage endpoints; posting
 	// them to /v2/storage/image is rejected.
 	uploadVideoURL = "https://firefly-3p.ff.adobe.io/v2/storage/video"
 	uploadAudioURL = "https://firefly-3p.ff.adobe.io/v2/storage/audio"
@@ -52,7 +52,14 @@ var (
 	// applies, but callers can single it out — unlike an expired access token this
 	// cannot be fixed by refreshing from the cookie, so the account is done.
 	ErrNotEntitled = fmt.Errorf("%w: user not entitled", ErrAuth)
+	// errTransport marks a request that never got a response back (EOF / 连接被切 /
+	// 超时)。上游没收到就没开始生成，所以原地换条连接重试是安全的。
+	errTransport = errors.New("transport failure")
 )
+
+// videoSubmitMaxRetries is how many extra in-place attempts a video submit gets
+// when the connection dies before any response arrives (EOF/reset/timeout).
+const videoSubmitMaxRetries = 3
 
 // isContentRejection reports whether an Adobe response (status + body) is a
 // content-safety refusal rather than a genuine upstream/account failure. Adobe
@@ -65,6 +72,20 @@ func isContentRejection(status int, body string) bool {
 		return false
 	}
 	return strings.Contains(body, "unsafe") || strings.Contains(body, "privacy_error")
+}
+
+// isClassifierGlitch reports whether a 400 comes from Adobe's media moderation
+// backend failing to READ the media it was handed ("Gemini classification API
+// returned HTTP 400 ... Cannot fetch content from the provided URL") rather than
+// from the request being wrong. The blobs were just uploaded and the identical
+// request succeeds on a retry, so this is a transient upstream fault: retrying
+// (with freshly uploaded blobs) is the fix, and the account must not be blamed.
+func isClassifierGlitch(status int, body string) bool {
+	if status != 400 {
+		return false
+	}
+	return strings.Contains(body, "media_classification_client_error") ||
+		strings.Contains(body, "classification API returned")
 }
 
 var profileURLs = []string{
@@ -174,7 +195,12 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 	case strings.HasPrefix(contentType, "audio/"):
 		endpoint = uploadAudioURL
 	}
+	// Seedance is a Firefly-native model: its uploads need the clio-playground-web
+	// key, the express key is rejected with 403 access_error.
 	apiKey := c.apiKey
+	if strings.HasPrefix(engine, "seedance-") {
+		apiKey = clioClientID
+	}
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(content))
 	if err != nil {
 		return nil, err, false
@@ -309,7 +335,22 @@ func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspec
 	if engine == "firefly-video" {
 		endpoint = fireflyVideoSubmitURL
 	}
+	// 连接在拿到响应前就断掉（EOF / reset / 超时）说明上游根本没收到这单，
+	// 换一条新连接原地重试，最多 videoSubmitMaxRetries 次。
 	respBody, pollURL, err := c.submitVideo(ctx, submitSess, token, endpoint, payload)
+	for attempt := 0; err != nil && errors.Is(err, errTransport) && attempt < videoSubmitMaxRetries && ctx.Err() == nil; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 2 * time.Second):
+		}
+		retrySess, sessErr := c.newTLSClient()
+		if sessErr != nil {
+			break
+		}
+		submitSess = retrySess
+		respBody, pollURL, err = c.submitVideo(ctx, submitSess, token, endpoint, payload)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -640,6 +681,9 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 		if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 			return nil, nil, fmt.Errorf("%w (poll %d: %s)", ErrDeadUpstream, resp.StatusCode, clip(body, 300))
 		}
+		if isClassifierGlitch(resp.StatusCode, string(body)) {
+			return nil, nil, fmt.Errorf("%w (poll classifier: %s)", ErrTemporaryUpstream, clip(body, 300))
+		}
 		if resp.StatusCode != 200 {
 			return nil, nil, fmt.Errorf("adobe poll failed: %d %s", resp.StatusCode, clip(body, 300))
 		}
@@ -685,8 +729,15 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		return nil, "", err
 	}
 	req = req.WithContext(ctx)
+	// Seedance is a Firefly-native model and needs the clio-playground-web key;
+	// the express key is rejected with 403 access_error. The origin stays on the
+	// Express surface for every engine — the upstream only gates on the key and
+	// x-arp-session-id, not on origin.
 	apiKey := c.apiKey
 	origin := "https://new.express.adobe.com"
+	if strings.EqualFold(stringValue(payload["modelId"]), "seedance") {
+		apiKey = clioClientID
+	}
 	req.Header = http.Header{
 		"authorization":      {"Bearer " + strings.TrimSpace(token)},
 		"x-api-key":          {apiKey},
@@ -731,7 +782,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 
 	resp, err := sess.client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+		return nil, "", fmt.Errorf("%w: %w: %v", ErrTemporaryUpstream, errTransport, err)
 	}
 	defer resp.Body.Close()
 
@@ -832,6 +883,9 @@ func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL
 		}
 		if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 			return nil, nil, fmt.Errorf("%w (video poll %d: %s)", ErrDeadUpstream, resp.StatusCode, clip(body, 300))
+		}
+		if isClassifierGlitch(resp.StatusCode, string(body)) {
+			return nil, nil, fmt.Errorf("%w (video poll classifier: %s)", ErrTemporaryUpstream, clip(body, 300))
 		}
 		if resp.StatusCode != 200 {
 			return nil, nil, fmt.Errorf("adobe video poll failed: %d %s", resp.StatusCode, clip(body, 300))
@@ -1043,11 +1097,12 @@ func exchangeCookieWithTLSClient(ctx context.Context, sess *tlsSession, cookie s
 	if token == "" {
 		return nil, errors.New("adobe cookie exchange missing access_token")
 	}
-	// The Express token (projectx_webapp) covers image/veo/luma/sora.
-	// firefly.adobe.com mints a second token for client_id=clio-playground-web
-	// with the creative_production scope, keyed by user_id. Mint that here too
-	// (best-effort: if it fails we keep the Express token so the other models
-	// still work).
+	// The Express token (projectx_webapp) covers image/veo/luma/sora but is not
+	// entitled to the Firefly-native seedance models — those return 403
+	// model_not_authorized. firefly.adobe.com mints a second token for
+	// client_id=clio-playground-web with the creative_production scope, keyed by
+	// user_id, which IS entitled. Mint that here too (best-effort: if it fails we
+	// keep the Express token so the other models still work).
 	if uid := ExtractAccountID(token); uid != "" {
 		clioBody := "client_id=" + clioClientID + "&scope=" + strings.ReplaceAll(clioScopeValue, ",", "%2C") + "&user_id=" + url.QueryEscape(uid)
 		if clioPayload, err := doCookieExchange(ctx, sess, cookie, clioBody, "https://firefly.adobe.com"); err == nil {

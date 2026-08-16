@@ -31,6 +31,7 @@ type MaintenanceService struct {
 	orders          *repo.OrderRepository
 	interval        time.Duration
 	stalePending    time.Duration
+	stalePendingVid time.Duration
 	mediaPruneEvery time.Duration
 	lastMediaPrune  time.Time
 }
@@ -49,6 +50,9 @@ func NewMaintenanceService(tokens *repo.TokenRepository, tokenSvc *TokenService,
 		orders:          orders,
 		interval:        60 * time.Second,
 		stalePending:    600 * time.Second,
+		// 视频比图片慢得多，单条执行预算就是 30 分钟（videoGenBudget），用图片的
+		// 10 分钟去扫会在它出片前判死并退款。
+		stalePendingVid: 30 * time.Minute,
 		mediaPruneEvery: 60 * time.Second,
 	}
 }
@@ -59,6 +63,10 @@ func NewMaintenanceService(tokens *repo.TokenRepository, tokenSvc *TokenService,
 func (m *MaintenanceService) Run(ctx context.Context) {
 	ticker := time.NewTicker(m.interval)
 	defer ticker.Stop()
+	// The leonardo session keep-alive gets its own loop: one tick() can take tens
+	// of minutes (219 adobe cookie profiles alone), which would stretch a 5-minute
+	// keep-alive to the tick's real duration.
+	go m.runLeonardoKeepalive(ctx)
 	m.tick(ctx)
 	for {
 		select {
@@ -66,6 +74,25 @@ func (m *MaintenanceService) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.tick(ctx)
+		}
+	}
+}
+
+// runLeonardoKeepalive re-checks every minute which leonardo accounts are due for
+// a session renewal (the 5-minute due-ness itself is read per account from the DB,
+// so a restart can't skip one).
+func (m *MaintenanceService) runLeonardoKeepalive(ctx context.Context) {
+	if m.tokenSvc == nil {
+		return
+	}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		m.tokenSvc.RefreshLeonardoSessions(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }
@@ -180,7 +207,7 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	// 3. Fail long-pending events so they stop blocking the per-user gate, and
 	//    refund the credits debited up-front for each abandoned generation (the
 	//    normal failure-refund path never ran for a process-restart orphan).
-	if purged, err := m.events.PurgeStale(ctx, m.stalePending); err != nil {
+	if purged, err := m.events.PurgeStale(ctx, m.stalePending, m.stalePendingVid); err != nil {
 		log.Printf("maintenance: purge_stale: %v", err)
 	} else if len(purged) > 0 {
 		refunded := 0
@@ -212,7 +239,7 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 			if !claimed {
 				continue
 			}
-			if _, err := m.users.AdjustCredits(ctx, e.UserID, e.Cost); err != nil {
+			if _, err := m.users.RefundCredits(ctx, e.UserID, e.Cost); err != nil {
 				log.Printf("maintenance: refund abandoned event %s (user %s, %.0f): %v", e.ID, e.UserID, e.Cost, err)
 			} else {
 				refunded++

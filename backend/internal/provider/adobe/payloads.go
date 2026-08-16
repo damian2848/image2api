@@ -330,6 +330,50 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			payload["referenceBlobs"] = refs
 		}
 		return payload
+	case "seedance-2.0-fast", "seedance-2.0":
+		modelVersion := "seedance_2.0"
+		if engine == "seedance-2.0-fast" {
+			modelVersion = "seedance_2.0_fast"
+		}
+		payload := map[string]any{
+			"modelId":            "seedance",
+			"modelVersion":       modelVersion,
+			"size":               videoSize(aspectRatio, resolution),
+			"seeds":              []int{seedVal},
+			"prompt":             prompt,
+			"negativePrompt":     "",
+			"duration":           durationSeconds,
+			"generateAudio":      true,
+			"generationSettings": map[string]any{"aspectRatio": aspectRatio},
+			"generationMetadata": map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
+			"output":             map[string]any{"storeInputs": true},
+			"referenceBlobs":     []any{},
+		}
+		if len(blobIDs) > 0 {
+			// Seedance keeps module "text2video" even with reference blobs
+			// (HAR-confirmed) — unlike veo/luma it does not switch to image2video.
+			if referenceMode == "frame" {
+				refs := make([]any, 0, min(len(blobIDs), 2))
+				for idx, id := range blobIDs[:min(len(blobIDs), 2)] {
+					refs = append(refs, map[string]any{"id": id, "usage": "frame", "order": idx + 1})
+				}
+				payload["referenceBlobs"] = refs
+			} else {
+				refs := make([]any, 0, min(len(blobIDs), 9))
+				for _, id := range blobIDs[:min(len(blobIDs), 9)] {
+					refs = append(refs, map[string]any{"id": id, "usage": "style"})
+				}
+				payload["referenceBlobs"] = refs
+			}
+		}
+		// Video/audio source refs (seedance)
+		for _, id := range videoBlobIDs[:min(len(videoBlobIDs), 3)] {
+			payload["referenceBlobs"] = append(payload["referenceBlobs"].([]any), map[string]any{"id": id, "usage": "source"})
+		}
+		for _, id := range audioBlobIDs[:min(len(audioBlobIDs), 3)] {
+			payload["referenceBlobs"] = append(payload["referenceBlobs"].([]any), map[string]any{"id": id, "usage": "source"})
+		}
+		return payload
 	case "luma":
 		payload := map[string]any{
 			"modelId":        "luma",

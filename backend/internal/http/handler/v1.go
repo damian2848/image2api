@@ -81,6 +81,22 @@ func (h *V1Handler) Models(c *gin.Context) {
 	})
 }
 
+// UserBalance — GET /v1/user/balance. 返回 API Key 所属用户的账户级余额
+// （剩余 / 累计已用），与具体令牌无关。
+func (h *V1Handler) UserBalance(c *gin.Context) {
+	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
+	if err != nil {
+		h.writeAuthError(c, err)
+		return
+	}
+	resp, err := h.v1.UserBalance(c.Request.Context(), principal)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load balance"})
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 // ImageGenerations — POST /v1/images/generations. Supports GPT Image 2's
 // image_size, aspect_ratio, and public image URL references, while retaining
 // legacy size (WxH) compatibility.
@@ -367,19 +383,24 @@ func rawToString(raw json.RawMessage) string {
 }
 
 // videoSizeToInternal maps OpenAI's "WxH" size to our aspect ratio + resolution
-// tier (height ≥1080 → 1080p, else 720p).
+// tier. An absent/unparsable size leaves the resolution empty so the caller can
+// fall back to whatever tier the model actually prices — hardcoding 720p here
+// rejects models that only offer 1440p.
 func videoSizeToInternal(size string) (ratio, resolution string) {
 	var w, h int
 	if s := strings.TrimSpace(strings.ToLower(size)); s != "" {
 		_, _ = fmt.Sscanf(s, "%dx%d", &w, &h)
 	}
 	if w == 0 || h == 0 {
-		return "16:9", "720p"
+		return "16:9", ""
 	}
 	// The "p" resolution is the SHORT edge (720p = 1280×720, 1080p = 1920×1080),
 	// so a standard 1280×720 must read as 720p — not 1080p off the long edge.
 	resolution = "720p"
-	if min(w, h) >= 1080 {
+	switch {
+	case min(w, h) >= 1440:
+		resolution = "1440p"
+	case min(w, h) >= 1080:
 		resolution = "1080p"
 	}
 	return guessRatioWH(w, h), resolution

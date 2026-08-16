@@ -90,7 +90,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 - **De-AI fingerprint** (optional): one-click toggle on the playground — generated images get anti-AI-detection post-processing (subtle detail jitter + metadata stripping), charged as a per-tier surcharge (defaults 1K+1 / 2K+2 / 4K+3 credits, admin-configurable, can be disabled globally); processed works carry a "de-AI" badge across the playground, gallery, logs and admin image manager
 
 #### 🔌 OpenAI Compatible
-- Text-to-image `/v1/images/generations` · async images `/v1/images/async/generations` → poll `/v1/images/async/{task_id}` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`) · `/v1/models`
+- Text-to-image `/v1/images/generations` · async images `/v1/images/async/generations` → poll `/v1/images/async/{task_id}` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`) · `/v1/models` · balance `/v1/user/balance` (remaining / cumulative used)
 - Images support `image_size` (1K/2K/4K), `aspect_ratio`, and an `image` array of public reference URLs; legacy `size` (WxH) remains supported. Video `size` maps by short edge to 720p/1080p
 - Image results return URLs; the in-app **/docs** includes complete sync, async, and resolution examples
 

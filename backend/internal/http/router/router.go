@@ -50,6 +50,7 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 	engine.GET("/health", handlers.Health.Handle)
 	engine.GET("/images/:user/:name", handlers.Images.Serve)
 	engine.GET("/v1/models", handlers.V1.Models)
+	engine.GET("/v1/user/balance", handlers.V1.UserBalance)
 	engine.POST("/v1/images/generations", handlers.V1.ImageGenerations)
 	// GPT Image 2-style async jobs. Keep the second path for clients that use
 	// the documented compatibility alias.
@@ -136,6 +137,7 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 		authed.POST("/tokens", handlers.ProviderAdmin.TokensCreate)
 		authed.POST("/tokens/import-chatgpt-token", handlers.ProviderAdmin.ImportChatGPTToken)
 		authed.POST("/tokens/import-adobe-cookie", handlers.ProviderAdmin.ImportAdobeCookie)
+		authed.POST("/tokens/import-creativefabrica-cookie", handlers.ProviderAdmin.ImportCreativeFabricaCookie)
 		authed.POST("/tokens/import-runway-token", handlers.ProviderAdmin.ImportRunwayToken)
 		authed.POST("/tokens/import-leonardo-cookie", handlers.ProviderAdmin.ImportLeonardoCookie)
 		authed.POST("/tokens/import-krea-cookie", handlers.ProviderAdmin.ImportKreaCookie)

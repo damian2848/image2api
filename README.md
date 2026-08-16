@@ -90,7 +90,7 @@
 - **去AI特征**(可选):画图台一键开启,生成图片自动做去AI痕迹处理(细节微扰 + 去除元数据),按画质档位加收积分(默认 1K+1 / 2K+2 / 4K+3,后台可改价、可整体关闭);带标记的作品在画图台、创作记录、日志与后台图片管理中均有「去AI特征」标识
 
 #### 🔌 OpenAI 兼容
-- 文生图 `/v1/images/generations` · 异步图片 `/v1/images/async/generations` → 轮询 `/v1/images/async/{task_id}` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`
+- 文生图 `/v1/images/generations` · 异步图片 `/v1/images/async/generations` → 轮询 `/v1/images/async/{task_id}` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models` · 余额 `/v1/user/balance`(剩余/累计已用)
 - 图像支持 `image_size`(1K/2K/4K) + `aspect_ratio` 与 `image` 公网参考图 URL（单个字符串或数组）;旧 `size`(WxH)仍可用。视频 `size` 按短边映射 720p/1080p
 - 图片结果返回 URL；站内 **/docs** 附完整同步、异步和分辨率示例
 

@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { api, jsonBody } from '../api'
-import { dedupeImportItems, parseImportInput } from '../utils/import'
+import { parseImportInput } from '../utils/import'
 import Icon from './Icon.vue'
 
 const emit = defineEmits(['close', 'imported'])
@@ -13,13 +13,12 @@ const isError = ref(false)
 const submitting = ref(false)
 
 // type → token pool (for the post-import weight PATCH).
-const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', runway: 'runway', leonardo: 'leonardo', krea: 'krea', imagine: 'imagine', grok: 'grok' }
+const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', runway: 'runway', leonardo: 'leonardo', krea: 'krea', imagine: 'imagine', grok: 'grok', creativefabrica: 'creativefabrica' }
 
 // Live preview of what the parser would extract — updates as the user types
 // so they can see whether their paste was understood before clicking import.
 const detected = computed(() => {
-  const parsed = parseImportInput(input.value)
-  const { items, skipped } = dedupeImportItems(parsed)
+  const items = parseImportInput(input.value)
   const openai = items.filter((x) => x.type === 'openai').length
   const adobe = items.filter((x) => x.type === 'adobe').length
   const runway = items.filter((x) => x.type === 'runway').length
@@ -27,7 +26,8 @@ const detected = computed(() => {
   const krea = items.filter((x) => x.type === 'krea').length
   const imagine = items.filter((x) => x.type === 'imagine').length
   const grok = items.filter((x) => x.type === 'grok').length
-  return { sourceTotal: parsed.length, total: items.length, skipped, openai, adobe, runway, leonardo, krea, imagine, grok }
+  const cf = items.filter((x) => x.type === 'creativefabrica').length
+  return { total: items.length, openai, adobe, runway, leonardo, krea, imagine, grok, cf }
 })
 
 function setStatus(text, err = false) {
@@ -36,14 +36,13 @@ function setStatus(text, err = false) {
 }
 
 async function doSmartImport() {
-  const { items, skipped: batchDuplicates } = dedupeImportItems(parseImportInput(input.value))
+  const items = parseImportInput(input.value)
   if (!items.length) {
-    if (batchDuplicates) setStatus(`已过滤 ${batchDuplicates} 个重复账号，无需导入`)
-    else setStatus('未识别到任何 Cookie 或 JWT', true)
+    setStatus('未识别到任何 Cookie 或 JWT', true)
     return
   }
   submitting.value = true
-  let ok = 0, fail = 0, duplicates = batchDuplicates
+  let ok = 0, fail = 0
   const errs = []
   for (let i = 0; i < items.length; i++) {
     const it = items[i]
@@ -60,7 +59,9 @@ async function doSmartImport() {
               ? await api('/tokens/import-krea-cookie', jsonBody('POST', { cookie: it.value }))
               : it.type === 'imagine'
                 ? await api('/tokens/import-imagine-token', jsonBody('POST', { value: it.value }))
-                : await api('/tokens/import-adobe-cookie', jsonBody('POST', { cookie: it.value }))
+                : it.type === 'creativefabrica'
+                  ? await api('/tokens/import-creativefabrica-cookie', jsonBody('POST', { cookie: it.value }))
+                  : await api('/tokens/import-adobe-cookie', jsonBody('POST', { cookie: it.value }))
       if (r.ok) {
         ok++
         // Apply the chosen weight to the freshly-imported account (best-effort).
@@ -78,17 +79,12 @@ async function doSmartImport() {
   // Quota isn't checked here — the server probes each token off-thread and the
   // account list flips pending → active/dead on its own.
   if (fail === 0) {
-    if (duplicates) {
-      setStatus(`已导入 ${ok} 个账号，已过滤 ${duplicates} 个重复账号`)
-      emit('imported')
-      return
-    }
     // Close immediately on success — the account lands in the table right away
     // and the server backfills quota/email off-thread (pending → active/dead).
     emit('imported')
     emit('close')
   } else {
-    setStatus(`成功 ${ok} · 重复 ${duplicates} · 失败 ${fail} · ${errs.slice(0, 3).join(' | ')}`, true)
+    setStatus(`成功 ${ok} · 失败 ${fail} · ${errs.slice(0, 3).join(' | ')}`, true)
     emit('imported')
   }
 }
@@ -112,8 +108,9 @@ async function doSmartImport() {
           <strong class="text-slate-700">Cookie 数组</strong>(多 Adobe 批量)、
           <strong class="text-slate-700">ChatGPT JWT</strong>(<code class="px-1 bg-slate-100 rounded">eyJhbGciOi...</code>)、
           <strong class="text-slate-700">Runway JWT</strong>(自动与 ChatGPT 区分)、
-          <strong class="text-slate-700">Leonardo Cookie</strong>(含 better-auth)、
+          <strong class="text-slate-700">Leonardo Cookie</strong>(须含 better-auth.session_data)、
           <strong class="text-slate-700">Krea Cookie</strong>(含 sb-superb-auth)、
+          <strong class="text-slate-700">Creative Fabrica Cookie</strong>(含 cfauth_* 或 wordpress_logged_in_)、
           <strong class="text-slate-700">Imagine Token</strong>(<code class="px-1 bg-slate-100 rounded">{"token","refreshToken","email","parentId"}</code>)、
           <strong class="text-slate-700">Grok SSO</strong>(grok.com 的 <code class="px-1 bg-slate-100 rounded">sso</code> 值,仅含 session_id,自动与 ChatGPT/Runway 区分)、
           <strong class="text-slate-700">多个 JWT</strong>(换行分隔)。
@@ -125,10 +122,9 @@ async function doSmartImport() {
         <textarea v-model="input" rows="10"
                   class="field font-mono text-xs resize-none"
                   placeholder="直接粘 Cookie 字符串 / JWT / JSON，自动识别"></textarea>
-        <div v-if="input.trim()" class="mt-2 flex flex-wrap items-center gap-2 text-xs">
-          <template v-if="detected.sourceTotal">
-            <span class="text-emerald-600">✓ 识别到 <strong class="tabular-nums">{{ detected.sourceTotal }}</strong> 个账号，待导入 <strong class="tabular-nums">{{ detected.total }}</strong> 个</span>
-            <span v-if="detected.skipped" class="text-amber-600">已过滤重复 · <strong class="tabular-nums">{{ detected.skipped }}</strong></span>
+        <div v-if="input.trim()" class="mt-2 flex items-center gap-2 text-xs">
+          <template v-if="detected.total">
+            <span class="text-emerald-600">✓ 识别到 <strong class="tabular-nums">{{ detected.total }}</strong> 个账号</span>
             <span v-if="detected.openai" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-emerald-700 bg-emerald-50 ring-1 ring-emerald-200">
               OpenAI · <span class="tabular-nums">{{ detected.openai }}</span>
             </span>
@@ -149,6 +145,9 @@ async function doSmartImport() {
             </span>
             <span v-if="detected.grok" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-slate-700 bg-slate-100 ring-1 ring-slate-300">
               Grok · <span class="tabular-nums">{{ detected.grok }}</span>
+            </span>
+            <span v-if="detected.cf" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-fuchsia-700 bg-fuchsia-50 ring-1 ring-fuchsia-200">
+              Creative Fabrica · <span class="tabular-nums">{{ detected.cf }}</span>
             </span>
           </template>
           <span v-else class="text-rose-600">未识别到任何 Cookie 或 JWT</span>

@@ -15,6 +15,7 @@ import (
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/chatgpt"
+	"backend/internal/provider/creativefabrica"
 	"backend/internal/provider/grok"
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
@@ -27,14 +28,15 @@ import (
 )
 
 var validTokenPools = map[string]string{
-	"chatgpt":  "openai",
-	"adobe":    "adobe",
-	"runway":   "runway",
-	"leonardo": "leonardo",
-	"krea":     "krea",
-	"imagine":  "imagine",
-	"grok":     "grok",
-	"custom":   "custom",
+	"chatgpt":         "openai",
+	"adobe":           "adobe",
+	"runway":          "runway",
+	"leonardo":        "leonardo",
+	"krea":            "krea",
+	"imagine":         "imagine",
+	"grok":            "grok",
+	"custom":          "custom",
+	"creativefabrica": "creativefabrica",
 }
 
 type TokenService struct {
@@ -49,6 +51,7 @@ type TokenService struct {
 	krea     *krea.Client
 	imagine  *imagine.Client
 	grok     *grok.Client
+	cf       *creativefabrica.Client
 	// sem caps concurrent background pending-probe goroutines (mirrors Python's
 	// 10-worker _quota_check_pool) so a big paste doesn't fire hundreds of
 	// simultaneous upstream requests.
@@ -56,9 +59,12 @@ type TokenService struct {
 	// kreaActivating guards the once-per-day krea /app activation sweep so the 60s
 	// maintenance tick can't pile up overlapping sweeps.
 	kreaActivating atomic.Bool
+	// leonardoKeeping guards the leonardo session keep-alive sweep so the 60s
+	// maintenance tick can't pile up overlapping sweeps.
+	leonardoKeeping atomic.Bool
 }
 
-func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client) *TokenService {
+func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, cfClient *creativefabrica.Client) *TokenService {
 	return &TokenService{
 		tokens:   tokens,
 		refresh:  refresh,
@@ -71,6 +77,7 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 		krea:     kreaClient,
 		imagine:  imagineClient,
 		grok:     grokClient,
+		cf:       cfClient,
 		sem:      make(chan struct{}, 10),
 	}
 }
@@ -98,6 +105,9 @@ func (s *TokenService) applyProxy(ctx context.Context) {
 	}
 	if s.grok != nil {
 		s.grok.SetProxy(proxy)
+	}
+	if s.cf != nil {
+		s.cf.SetProxy(proxy)
 	}
 }
 
@@ -135,6 +145,78 @@ func (s *TokenService) RefreshExpiringTokens(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// leonardoKeepaliveEvery is how long a leonardo cookie may go unrenewed. The due
+// check reads each account's own meta["session_kept_at"], so the cadence survives
+// a restart (no in-memory timer to lose) — after a restart every account whose
+// stamp is older than this is simply due again.
+const leonardoKeepaliveEvery = 5 * time.Minute
+
+// leonardoKeptAtKey stamps the last successful session keep-alive.
+const leonardoKeptAtKey = "session_kept_at"
+
+// RefreshLeonardoSessions re-mints a session for every live leonardo account whose
+// last keep-alive is older than leonardoKeepaliveEvery, instead of waiting for the
+// ~1h bearer cache to lapse or for the account to be used. get-session rolls the
+// better-auth session (expiresAt is pushed out) and may rotate CF_Access_Token /
+// session_data, so the rotated cookie is written back. It never disables an
+// account: a dead cookie is left to the quota-refresh strike logic, which
+// double-checks before killing.
+func (s *TokenService) RefreshLeonardoSessions(ctx context.Context) {
+	if s.leonardo == nil {
+		return
+	}
+	if !s.leonardoKeeping.CompareAndSwap(false, true) {
+		return // a sweep is already running
+	}
+	bg := context.WithoutCancel(ctx)
+	go func() {
+		defer s.leonardoKeeping.Store(false)
+		items, err := s.tokens.ListByPool(bg, "leonardo")
+		if err != nil {
+			return
+		}
+		due := time.Now().Add(-leonardoKeepaliveEvery).Unix()
+		proxied := false
+		renewed, failed := 0, 0
+		for i := range items {
+			a := items[i]
+			if a.Dead || a.Status == "disabled" || strings.TrimSpace(a.Value) == "" {
+				continue
+			}
+			if at, ok := jsonMapInt(a.Meta, leonardoKeptAtKey); ok && int64(at) > due {
+				continue // renewed less than leonardoKeepaliveEvery ago
+			}
+			if !proxied {
+				s.applyProxy(bg)
+				proxied = true
+			}
+			callCtx, cancel := context.WithTimeout(bg, 90*time.Second)
+			_, err := s.leonardo.ProbeSession(callCtx, a.Value)
+			if err != nil {
+				cancel()
+				failed++
+				if errors.Is(err, leonardo.ErrAuth) {
+					log.Printf("leonardo %s: session keepalive auth failure (%v)", a.ID, err)
+				}
+				continue // leave the stamp alone so the next tick retries
+			}
+			if fresh, ok := s.leonardo.RotatedCookie(a.Value); ok && strings.TrimSpace(fresh) != "" {
+				_, _ = s.tokens.SwapValue(callCtx, "leonardo", a.ID, a.Value, fresh)
+			}
+			fields := map[string]any{}
+			meta := cloneJSONMap(a.Meta)
+			meta[leonardoKeptAtKey] = int(time.Now().Unix())
+			fields["meta"] = meta
+			_, _ = s.tokens.Update(callCtx, "leonardo", a.ID, fields)
+			cancel()
+			renewed++
+		}
+		if renewed > 0 || failed > 0 {
+			log.Printf("leonardo: session keepalive renewed %d, failed %d", renewed, failed)
+		}
+	}()
 }
 
 // ActivateKreaDue loads /app (Activate) for each krea account that hasn't been
@@ -341,6 +423,11 @@ func (s *TokenService) ImportLeonardoCookie(ctx context.Context, cookie, tokenID
 	if !leonardo.IsLeonardoCookie(cookie) {
 		return nil, errors.New("not a leonardo cookie")
 	}
+	// get-session 认的是 better-auth 的 session_data 缓存 cookie：只有 session_token
+	// 时它返回 200 null（换不到 accessToken），和死号一模一样，所以导入就拦掉。
+	if !leonardo.HasSessionData(cookie) {
+		return nil, errors.New("leonardo cookie 缺少 __Secure-better-auth.session_data，请复制完整 cookie")
+	}
 	if existing, err := s.tokens.GetByPoolValue(ctx, "leonardo", cookie); err != nil {
 		return nil, err
 	} else if existing != nil {
@@ -376,6 +463,18 @@ func (s *TokenService) ImportLeonardoCookie(ctx context.Context, cookie, tokenID
 	return item, nil
 }
 
+// persistLeonardoCookie writes back the account cookie when Leonardo rotated its
+// better-auth session_data cache — that cache is what authenticates get-session,
+// so keeping a stale copy would eventually look like a dead account.
+func (s *TokenService) persistLeonardoCookie(ctx context.Context, tokenID, cookie string) {
+	if s.leonardo == nil {
+		return
+	}
+	if fresh, ok := s.leonardo.RotatedCookie(cookie); ok && strings.TrimSpace(fresh) != "" {
+		_, _ = s.tokens.SwapValue(ctx, "leonardo", tokenID, cookie, fresh)
+	}
+}
+
 // checkPendingLeonardo validates a freshly imported Leonardo cookie off-thread:
 // get-session must succeed (else the cookie is dead → disabled), then it hydrates
 // email/display-name + the token balance and the daily renewal time (so the
@@ -397,6 +496,7 @@ func (s *TokenService) checkPendingLeonardo(tokenID, cookie string) {
 	}
 	s.applyProxy(ctx)
 	data, err := s.leonardo.FetchCreditsBalance(ctx, cookie)
+	s.persistLeonardoCookie(ctx, tokenID, cookie)
 	if err != nil {
 		if errors.Is(err, leonardo.ErrAuth) {
 			s.finishPending(ctx, "leonardo", tokenID, "disabled", true, nil)
@@ -408,9 +508,6 @@ func (s *TokenService) checkPendingLeonardo(tokenID, cookie string) {
 	}
 	seed := map[string]any{}
 	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
-		if s.discardPendingDuplicate(ctx, "leonardo", tokenID, em) {
-			return
-		}
 		seed["account_email"] = em
 	}
 	if dn := strings.TrimSpace(stringValue(data["display_name"])); dn != "" {
@@ -518,9 +615,6 @@ func (s *TokenService) checkPendingKrea(tokenID, cookie string) {
 		return
 	}
 	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
-		if s.discardPendingDuplicate(ctx, "krea", tokenID, em) {
-			return
-		}
 		_, _ = s.tokens.Update(ctx, "krea", tokenID, map[string]any{"account_email": em})
 	}
 	quotaMeta := map[string]any{}
@@ -616,9 +710,6 @@ func (s *TokenService) checkPendingImagine(tokenID, cred string) {
 		return
 	}
 	if em := strings.TrimSpace(stringValue(data["email"])); em != "" {
-		if s.discardPendingDuplicate(ctx, "imagine", tokenID, em) {
-			return
-		}
 		_, _ = s.tokens.Update(ctx, "imagine", tokenID, map[string]any{"account_email": em})
 	}
 	quotaMeta := map[string]any{}
@@ -633,16 +724,6 @@ func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID st
 	cookie = cleanAdobeCookie(cookie)
 	if cookie == "" {
 		return nil, nil, errors.New("cookie required")
-	}
-	if profile, err := s.refresh.GetByPoolCookie(ctx, "adobe", cookie); err != nil {
-		return nil, nil, err
-	} else if profile != nil {
-		if existing, getErr := s.tokens.Get(ctx, "adobe", profile.ID); getErr == nil {
-			return existing, profile, nil
-		}
-		// A stale refresh profile without its token can be safely reused. This keeps
-		// its cookie/profile pair aligned instead of adding a second one.
-		tokenID = profile.ID
 	}
 	if tokenID == "" {
 		tokenID = newTokenID("adobe")
@@ -724,9 +805,6 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 	// Seed the real access token, then activate so the pool can schedule it.
 	seed := map[string]any{"value": result.AccessToken}
 	email, exp := parseJWTEmailExpiry(result.AccessToken)
-	if email != "" && s.discardPendingDuplicate(ctx, "adobe", tokenID, email) {
-		return
-	}
 	if email != "" {
 		seed["account_email"] = email
 	}
@@ -754,7 +832,8 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 		}
 		quotaMeta["plan"] = planCap
 		// VIP 号导入即固定 母号/子号 身份并显式写入 is_sub_account：积分 1..4000 视为子号，
-		// 其余（含 >4000）为母号(false)。
+		// 其余（含 >4000）为母号(false)。母号必须显式写 false，否则 isVipMotherAccount
+		// 因字段缺失把它判为非母号，导致 Seedance 无号可调度。
 		if isVIP {
 			quotaMeta["is_sub_account"] = rem > 0 && rem <= 4000
 		}
@@ -786,9 +865,6 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 	if prof, e := s.adobe.FetchAccountProfile(ctx, result.AccessToken); e == nil {
 		p := map[string]any{}
 		if em := strings.TrimSpace(stringValue(prof["email"])); em != "" {
-			if s.discardPendingDuplicate(ctx, "adobe", tokenID, em) {
-				return
-			}
 			p["account_email"] = em
 		}
 		if dn := strings.TrimSpace(stringValue(prof["display_name"])); dn != "" {
@@ -937,13 +1013,11 @@ func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID st
 		return nil, errors.New("not a grok sso token")
 	}
 	sid := grok.SessionIDFromToken(ssoToken)
-	if existing, err := s.tokens.GetByPoolSessionID(ctx, "grok", sid); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
-	// Grok SSO JWTs have no stable email claim, but their session id is stable
-	// enough to reject repeated imports before the asynchronous profile lookup.
+	// Fully async, no dedup: every import mints a fresh row (a passed-in tokenID is
+	// an explicit edit → update). We do NOT look up an existing account by
+	// email/session_id, and we leave account_email empty — email, quota and
+	// recovery time are all filled off-thread by checkPendingGrok, which also
+	// disables the account if the sso session is dead.
 	if strings.TrimSpace(tokenID) == "" {
 		tokenID = newTokenID("grok")
 	}
@@ -992,9 +1066,6 @@ func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 			return
 		}
 	} else if strings.TrimSpace(email) != "" {
-		if s.discardPendingDuplicate(ctx, "grok", tokenID, email) {
-			return
-		}
 		_, _ = s.tokens.Update(ctx, "grok", tokenID, map[string]any{"account_email": strings.TrimSpace(email)})
 	}
 	// Console 没有额度接口，所以额度不查上游：导入即写死 图 5 / 视频 2，生成时各扣各的，
@@ -1067,6 +1138,85 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 	}
 }
 
+// ImportCreativeFabricaCookie imports a Creative Fabrica session cookie the same
+// way Adobe does (paste the whole Cookie header; JSON array/object accepted).
+// The cookie IS the credential — a fresh short-lived JWT is minted on demand via
+// /query/userAuth, so no RefreshProfile is registered (there is nothing to
+// refresh). Accounts are one-shot: their coins buy exactly one generation, so a
+// successful render disables the account (see generateCreativeFabricaVideo).
+func (s *TokenService) ImportCreativeFabricaCookie(ctx context.Context, cookie, tokenID string) (*model.TokenAccount, error) {
+	cookie = cleanAdobeCookie(cookie)
+	if cookie == "" {
+		return nil, errors.New("cookie required")
+	}
+	if tokenID == "" {
+		tokenID = newTokenID("creativefabrica")
+	}
+	meta := datatypes.JSONMap{"pending_check": true}
+	item, err := s.createToken(ctx, "creativefabrica", tokenID, cookie, "pending", meta)
+	if err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			item, err = s.tokens.Update(ctx, "creativefabrica", tokenID, map[string]any{
+				"status": "pending",
+				"meta":   meta,
+			})
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+	go s.checkPendingCreativeFabrica(tokenID, cookie)
+	return item, nil
+}
+
+// checkPendingCreativeFabrica probes a freshly imported cookie off-thread:
+// /query/userAuth must mint a token (else the cookie is dead), then best-effort
+// balance hydration. Balance of exactly 0 means the account can't generate →
+// dead.
+func (s *TokenService) checkPendingCreativeFabrica(tokenID, cookie string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("token import: creativefabrica pending check panicked for %s: %v", tokenID, r)
+		}
+	}()
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	if s.cf == nil {
+		s.finishPending(ctx, "creativefabrica", tokenID, "disabled", true, nil)
+		return
+	}
+	if _, _, err := s.cf.ExchangeToken(ctx, cookie); err != nil {
+		log.Printf("token import: creativefabrica %s cookie failed to authenticate, marking dead: %v", tokenID, err)
+		s.finishPending(ctx, "creativefabrica", tokenID, "disabled", true, nil)
+		return
+	}
+	meta := map[string]any{}
+	// Best-effort profile hydration: the studio browser hits /query/user on
+	// every page load, so the email is free to grab here (avoids 邮箱列 showing
+	// the raw id).
+	if email, e := s.cf.FetchUser(ctx, cookie); e == nil && strings.TrimSpace(email) != "" {
+		if _, uerr := s.tokens.Update(ctx, "creativefabrica", tokenID, map[string]any{"account_email": strings.TrimSpace(email)}); uerr != nil {
+			log.Printf("token import: creativefabrica %s email write failed: %v", tokenID, uerr)
+		}
+	}
+	if bal, e := s.cf.FetchBalance(ctx, cookie); e == nil {
+		meta["cached_quota_remaining"] = bal
+		meta["cached_quota_at"] = int(time.Now().Unix())
+		// One-shot accounts with zero coins left can't generate at all.
+		if bal <= 0 {
+			log.Printf("token import: creativefabrica %s has 0 coins, marking dead", tokenID)
+			s.finishPending(ctx, "creativefabrica", tokenID, "disabled", true, meta)
+			return
+		}
+	}
+	s.finishPending(ctx, "creativefabrica", tokenID, "active", false, meta)
+}
+
 // ImportCustomAccount adds an upstream as a custom account: base_url + key, the
 // csv list of model ids it serves (empty = all), plus optional weight and
 // per-account concurrency. No probe — the account goes active immediately and is
@@ -1129,6 +1279,24 @@ func (s *TokenService) ImportCustomAccount(ctx context.Context, baseURL, apiKey,
 	return item, nil
 }
 
+// leonardoAuthStrikeLimit 是 leonardo 号被判死前允许的连续鉴权失败次数。上游偶发
+// 返回 200 null / 401(cookie 轮换竞态、人机校验)时一次就判死会误杀健康号，所以要
+// 连续失败到这个次数才判死；任何一次成功都会清零。
+const leonardoAuthStrikeLimit = 3
+
+// leonardoAuthStrike 记一次鉴权失败：返回要写回的 meta、当前连续失败次数,以及是否
+// 该判死。
+func leonardoAuthStrike(item *model.TokenAccount, reason string) (datatypes.JSONMap, int, bool) {
+	meta := cloneJSONMap(item.Meta)
+	strikes := 1
+	if n, ok := jsonMapInt(item.Meta, "auth_fails"); ok {
+		strikes = n + 1
+	}
+	meta["auth_fails"] = strikes
+	meta["last_auth_error"] = reason
+	return meta, strikes, strikes >= leonardoAuthStrikeLimit
+}
+
 // finishPending writes the terminal status/dead flag and clears the pending_check
 // marker (merging any cached quota) for a background import probe.
 func (s *TokenService) finishPending(ctx context.Context, pool, id, status string, dead bool, quotaMeta map[string]any) {
@@ -1146,23 +1314,6 @@ func (s *TokenService) finishPending(ctx context.Context, pool, id, status strin
 		patch["dead"] = true
 	}
 	_, _ = s.tokens.Update(ctx, pool, id, patch)
-}
-
-// discardPendingDuplicate removes the newly-created pending candidate when its
-// verified account identity already exists in the same provider pool. Existing
-// accounts are deliberately kept intact; this is a filter, not a destructive
-// merge of user-configured quota, weight, or status fields.
-func (s *TokenService) discardPendingDuplicate(ctx context.Context, pool, id, email string) bool {
-	existing, err := s.tokens.GetByPoolEmail(ctx, pool, email)
-	if err != nil || existing == nil || existing.ID == id {
-		return false
-	}
-	if _, err := s.tokens.Delete(ctx, pool, id); err != nil {
-		return false
-	}
-	_ = s.refresh.Delete(ctx, id)
-	log.Printf("token import: filtered duplicate %s account %s (kept %s for %s)", pool, id, existing.ID, strings.TrimSpace(email))
-	return true
 }
 
 func (s *TokenService) Update(ctx context.Context, pool, id string, body map[string]any) (*model.TokenAccount, error) {
@@ -1194,12 +1345,6 @@ func (s *TokenService) Update(ctx context.Context, pool, id string, body map[str
 	}
 	if raw, ok := body["fails"]; ok {
 		patch["fails"] = intValue(raw)
-	}
-	if raw, ok := body["free_allowed"]; ok {
-		if pool != "adobe" {
-			return nil, errors.New("free_allowed is only supported for adobe accounts")
-		}
-		patch["free_allowed"] = boolValueWithDefault(raw, false)
 	}
 	if len(patch) == 0 {
 		return s.tokens.Get(ctx, pool, id)
@@ -1233,7 +1378,19 @@ func (s *TokenService) Delete(ctx context.Context, pool, id string) error {
 // DeleteBulk removes many accounts by id (across pools) plus their cookie
 // refresh profiles. Returns how many account rows were removed.
 func (s *TokenService) DeleteBulk(ctx context.Context, ids []string) (int, error) {
-	clean := uniqueTokenIDs(ids)
+	seen := make(map[string]struct{}, len(ids))
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		clean = append(clean, id)
+	}
 	if len(clean) == 0 {
 		return 0, nil
 	}
@@ -1251,19 +1408,6 @@ func (s *TokenService) DeleteBulk(ctx context.Context, ids []string) (int, error
 // Other provider accounts and Adobe memberships are intentionally skipped: the
 // override has no meaning for them because their normal model policy differs.
 func (s *TokenService) SetFreeAllowedBulk(ctx context.Context, ids []string, allowed bool) (updated, skipped int, err error) {
-	clean := uniqueTokenIDs(ids)
-	if len(clean) == 0 {
-		return 0, 0, nil
-	}
-	rows, err := s.tokens.SetFreeAllowedByIDs(ctx, clean, allowed)
-	if err != nil {
-		return 0, 0, err
-	}
-	updated = int(rows)
-	return updated, len(clean) - updated, nil
-}
-
-func uniqueTokenIDs(ids []string) []string {
 	seen := make(map[string]struct{}, len(ids))
 	clean := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -1277,7 +1421,15 @@ func uniqueTokenIDs(ids []string) []string {
 		seen[id] = struct{}{}
 		clean = append(clean, id)
 	}
-	return clean
+	if len(clean) == 0 {
+		return 0, 0, nil
+	}
+	rows, err := s.tokens.SetFreeAllowedByIDs(ctx, clean, allowed)
+	if err != nil {
+		return 0, 0, err
+	}
+	updated = int(rows)
+	return updated, len(clean) - updated, nil
 }
 
 func (s *TokenService) Accounts(ctx context.Context) ([]map[string]any, error) {
@@ -1525,19 +1677,26 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 	if poolToType(item.Pool) == "leonardo" && s.leonardo != nil {
 		s.applyProxy(ctx)
 		data, err := s.leonardo.FetchCreditsBalance(ctx, item.Value)
+		s.persistLeonardoCookie(ctx, item.ID, item.Value)
 		if err != nil {
 			if errors.Is(err, leonardo.ErrAuth) {
-				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-					"status": "disabled",
-					"dead":   true,
-					"fails":  gorm.Expr("fails + 1"),
-				})
+				meta, strikes, kill := leonardoAuthStrike(item, "quota refresh: "+err.Error())
+				patch := map[string]any{"meta": meta, "fails": gorm.Expr("fails + 1")}
+				if kill {
+					patch["status"] = "disabled"
+					patch["dead"] = true
+					log.Printf("account leonardo/%s disabled after %d consecutive auth failures: %v", item.ID, strikes, err)
+				} else {
+					log.Printf("leonardo %s: auth failure %d/%d on quota refresh (%v) — kept active", item.ID, strikes, leonardoAuthStrikeLimit, err)
+				}
+				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, patch)
 			}
 			return nil, err
 		}
 		patch := map[string]any{}
 		meta := cloneJSONMap(item.Meta)
 		meta["cached_quota_at"] = int(time.Now().Unix())
+		meta["auth_fails"] = 0 // cookie 还能换 token，连续失败计数清零
 		if remaining, ok := data["remaining"].(int); ok {
 			meta["cached_quota_remaining"] = remaining
 			// Below the per-generation floor → sink to "限额" so it stops being
@@ -1682,8 +1841,33 @@ func (s *TokenService) Email(ctx context.Context, pool, id string) (map[string]a
 		}
 		return map[string]any{"email": nil, "cached": false}, nil
 	}
-	if poolToType(item.Pool) != "adobe" {
+	if poolToType(item.Pool) != "adobe" && poolToType(item.Pool) != "creativefabrica" {
 		return map[string]any{"email": nil}, nil
+	}
+	if poolToType(item.Pool) == "creativefabrica" {
+		email := strings.TrimSpace(item.AccountEmail)
+		if email != "" {
+			return map[string]any{"email": email, "cached": true}, nil
+		}
+		if s.cf == nil {
+			return map[string]any{"email": nil, "cached": false}, nil
+		}
+		fetched, err := s.cf.FetchUser(ctx, item.Value)
+		if err != nil {
+			if errors.Is(err, creativefabrica.ErrAuth) {
+				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
+					"status": "disabled",
+					"dead":   true,
+					"fails":  gorm.Expr("fails + 1"),
+				})
+			}
+			return nil, err
+		}
+		if fetched = strings.TrimSpace(fetched); fetched != "" {
+			_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{"account_email": fetched})
+			email = fetched
+		}
+		return map[string]any{"email": emptyToNil(email), "cached": false}, nil
 	}
 	email := strings.TrimSpace(item.AccountEmail)
 	if email == "" {
@@ -1769,7 +1953,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		}
 		grokImages, grokVideos = images, videos
 	}
-	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok"
+	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok" || typeLabel == "creativefabrica"
 	return map[string]any{
 		"id":                item.ID,
 		"pool":              item.Pool,
@@ -1960,6 +2144,9 @@ func newTokenID(pool string) string {
 	}
 	if pool == "imagine" {
 		prefix = "IM"
+	}
+	if pool == "creativefabrica" {
+		prefix = "CF"
 	}
 	return prefix + randomUpper(10)
 }

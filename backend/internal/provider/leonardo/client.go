@@ -28,8 +28,24 @@ import (
 const (
 	appBase       = "https://app.leonardo.ai"
 	graphqlURL    = "https://api.leonardo.ai/v1/graphql"
-	schemaVersion = "1.187.0"
+	schemaVersion = "1.255.2"
 	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+	// sec-ch-ua must agree with userAgent's major version — a mismatch is itself a
+	// bot signal.
+	secChUA = `"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"`
+	// get-session only answers with a token once better-auth's cookie cache has
+	// been refreshed by a cross-origin-cookie call; called cold it returns 200
+	// null, which looks exactly like a dead cookie. It also sits behind Vercel's
+	// checkpoint, which 429s machine requests from some exit IPs — so a failed
+	// attempt is retried, falling back to the proxy for a different exit IP.
+	getSessionAttempts   = 10
+	getSessionRetryDelay = 2 * time.Second
+	// A warmed 200 null usually means the session is gone server-side, but the
+	// same answer also comes back when the checkpoint silently serves a session-
+	// less page to an exit IP — so retry it a few times (later attempts through
+	// the proxy) before calling the account dead. Fewer attempts than the 429
+	// budget: each one costs two requests and a truly dead cookie never recovers.
+	getSessionNullAttempts = 3
 )
 
 var (
@@ -45,10 +61,19 @@ type Client struct {
 	// (429) hard, so re-using the ~1h JWT is essential.
 	mu       sync.Mutex
 	sessions map[string]*Session
+	// rotated maps a stored cookie to the freshest value Leonardo handed back via
+	// Set-Cookie (better-auth rotates its session_data cookie cache). The service
+	// persists it; keeping it here means an unpersisted rotation still works for
+	// the rest of the process's life.
+	rotated map[string]string
+	// refreshing serialises get-session per cookie. Two concurrent refreshes hand
+	// Cognito the same refresh token twice and its reuse detection revokes the
+	// whole session — the account then answers 401 forever.
+	refreshing map[string]*sync.Mutex
 }
 
 func NewClient(proxy string) *Client {
-	return &Client{proxy: strings.TrimSpace(proxy), sessions: map[string]*Session{}}
+	return &Client{proxy: strings.TrimSpace(proxy), sessions: map[string]*Session{}, rotated: map[string]string{}, refreshing: map[string]*sync.Mutex{}}
 }
 
 func (c *Client) SetProxy(proxy string) {
@@ -63,6 +88,83 @@ func IsLeonardoCookie(value string) bool {
 		strings.Contains(value, "better-auth.session_data")
 }
 
+// HasSessionData reports whether the cookie carries better-auth's session_data
+// cache. Leonardo authenticates get-session off THAT cookie: session_token alone
+// answers 200 null (no bearer), which looks exactly like a dead account — so a
+// cookie without it must be rejected at import instead of dying later.
+func HasSessionData(value string) bool {
+	return strings.Contains(value, "better-auth.session_data")
+}
+
+// RotatedCookie returns the freshest value for a stored cookie when Leonardo
+// rotated its session_data cache, so the caller can persist it.
+func (c *Client) RotatedCookie(cookie string) (string, bool) {
+	key := strings.TrimSpace(cookie)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fresh, ok := c.rotated[key]
+	return fresh, ok && fresh != key
+}
+
+// mergeCookies applies a response's Set-Cookie pairs onto a request cookie
+// string, keeping the original order and appending new names.
+func mergeCookies(cookie string, setCookies []string) string {
+	if len(setCookies) == 0 {
+		return cookie
+	}
+	updates := map[string]string{}
+	order := []string{}
+	for _, sc := range setCookies {
+		pair := strings.TrimSpace(strings.Split(sc, ";")[0])
+		name, value, ok := strings.Cut(pair, "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			continue
+		}
+		if _, seen := updates[name]; !seen {
+			order = append(order, name)
+		}
+		updates[name] = value
+	}
+	if len(updates) == 0 {
+		return cookie
+	}
+	var out []string
+	used := map[string]bool{}
+	for _, part := range strings.Split(cookie, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, _, _ := strings.Cut(part, "=")
+		name = strings.TrimSpace(name)
+		if v, ok := updates[name]; ok {
+			used[name] = true
+			if v == "" { // a cleared cookie drops out
+				continue
+			}
+			out = append(out, name+"="+v)
+			continue
+		}
+		out = append(out, part)
+	}
+	for _, name := range order {
+		if used[name] || updates[name] == "" {
+			continue
+		}
+		out = append(out, name+"="+updates[name])
+	}
+	return strings.Join(out, "; ")
+}
+
+// keepsSession reports whether a merged cookie still carries BOTH components
+// get-session needs: the session token and better-auth's session_data cache.
+// A merge that loses either one (a Set-Cookie clearing a cache chunk) must be
+// discarded — sending it would answer 200 null, i.e. look like a dead account.
+func keepsSession(cookie string) bool {
+	return strings.Contains(cookie, "__Secure-better-auth.session_token") && HasSessionData(cookie)
+}
+
 // Session is the result of /api/auth/get-session: the short-lived bearer plus the
 // ids the GraphQL API needs (cognitoSub for the quota query, userId for the feed
 // and the CDN image path) and the human-facing account fields.
@@ -73,10 +175,14 @@ type Session struct {
 	Email       string
 	Name        string
 	ExpiresAt   int64
+	// Cookie is the cookie that produced this session, with any Set-Cookie
+	// rotation applied — persist it so the account keeps authenticating.
+	Cookie string
 }
 
-// GetSession exchanges the cookie for a fresh access token + account ids. A 401/403
-// (or a response with no access token) means the cookie/session is dead → ErrAuth.
+// GetSession exchanges the cookie for a fresh access token + account ids. Only a
+// 401 or a 200 carrying no access token means the session is dead → ErrAuth;
+// everything else (notably the 403/429 人机校验 page) is a temporary error.
 func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error) {
 	cookie = strings.TrimSpace(cookie)
 	if cookie == "" {
@@ -91,41 +197,95 @@ func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error
 	}
 	c.mu.Unlock()
 
-	client, err := c.newDirectTLSClient()
-	if err != nil {
-		return nil, err
+	// Only one refresh per cookie at a time; the others wait and then re-use the
+	// token it minted.
+	gate := c.refreshGate(cookie)
+	gate.Lock()
+	defer gate.Unlock()
+	c.mu.Lock()
+	if cs, ok := c.sessions[cookie]; ok && cs.ExpiresAt-60 > time.Now().Unix() {
+		c.mu.Unlock()
+		return cs, nil
 	}
-	req, err := http.NewRequest(http.MethodGet, appBase+"/api/auth/get-session", nil)
-	if err != nil {
-		return nil, err
+	c.mu.Unlock()
+
+	// Use the freshest known value (an earlier response may have rotated the
+	// better-auth cookie cache) rather than the possibly stale stored cookie.
+	send := cookie
+	c.mu.Lock()
+	if fresh, ok := c.rotated[cookie]; ok && fresh != "" {
+		send = fresh
 	}
-	req = req.WithContext(ctx)
-	req.Header = http.Header{
-		"accept":          {"*/*"},
-		"accept-language": {"en-US,en;q=0.9"},
-		"cookie":          {cookie},
-		"origin":          {appBase},
-		"referer":         {appBase + "/"},
-		"user-agent":      {userAgent},
-		"sec-fetch-dest":  {"empty"},
-		"sec-fetch-mode":  {"cors"},
-		"sec-fetch-site":  {"same-origin"},
-		http.HeaderOrderKey: {
-			"accept", "accept-language", "cookie", "origin", "referer",
-			"user-agent", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
-		},
+	c.mu.Unlock()
+
+	var body []byte
+	var status int
+	var setCookies []string
+	var err error
+	var warmed bool
+	// 401 from cross-origin-cookie means Leonardo已经作废了这个 session（不是人机校验），
+	// 记下来好把日志写成"会话被吊销"而不是含糊的 get-session null。
+	warmStatus := 0
+	for attempt := 0; attempt < getSessionAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(getSessionRetryDelay):
+			}
+		}
+		// The local IP normally passes the checkpoint; only once it doesn't is the
+		// proxy worth its latency (and its own share of 429s).
+		useProxy := attempt > 0 && c.proxy != ""
+		client, cerr := c.newTLSClientP(useProxy)
+		if cerr != nil {
+			err = cerr
+			continue
+		}
+		// Warm up on the same connection: cross-origin-cookie hands back a fresh
+		// better-auth cookie cache (and CF_Access_Token). Without it get-session
+		// answers 200 null even for a perfectly healthy cookie.
+		warmed = false
+		warmCookies, wstatus, werr := c.warmSession(ctx, client, send)
+		warmStatus = wstatus
+		if werr == nil {
+			warmed = true
+			if merged := mergeCookies(send, warmCookies); merged != send && keepsSession(merged) {
+				send = merged
+			}
+		}
+		status, body, setCookies, err = c.fetchSession(ctx, client, send)
+		if err == nil && warmed && status != 429 && status != 403 {
+			if status == 200 && sessionAccessToken(body) == "" && attempt < getSessionNullAttempts-1 {
+				continue // retry a null session on another exit IP before giving up
+			}
+			break
+		}
 	}
-	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, err.Error())
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, ErrAuth
+	// Only a real app answer may rotate the stored cookie. The 403/429 人机校验 页
+	// also sends Set-Cookie (often CLEARING better-auth cookies), and persisting
+	// that would strip the session_data cache — after which get-session answers
+	// 200 null and a perfectly healthy account looks dead.
+	if status == 200 {
+		if merged := mergeCookies(send, setCookies); keepsSession(merged) {
+			send = merged
+		}
+		if send != cookie {
+			c.mu.Lock()
+			c.rotated[cookie] = send
+			c.mu.Unlock()
+		}
 	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("%w: get-session http %d: %s", ErrTemporaryUpstream, resp.StatusCode, clip(body, 160))
+	if status == 401 {
+		return nil, fmt.Errorf("%w: get-session http 401: %s", ErrAuth, clip(body, 160))
+	}
+	if status != 200 {
+		// 403 / 429 here is the Vercel / Cloudflare 人机校验 页，不是 cookie 失效 —
+		// 当成临时错误，否则健康的号会被误判死。
+		return nil, fmt.Errorf("%w: get-session http %d: %s", ErrTemporaryUpstream, status, clip(body, 160))
 	}
 	var raw struct {
 		Session struct {
@@ -145,8 +305,19 @@ func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error
 		return nil, fmt.Errorf("%w: get-session non-json", ErrTemporaryUpstream)
 	}
 	if strings.TrimSpace(raw.Session.AccessToken) == "" {
-		// No bearer despite 200 → the cookie no longer authenticates.
-		return nil, ErrAuth
+		if warmStatus == 401 {
+			// Leonardo 明确拒了这份 session_token：服务端已把会话吊销，重新导入 cookie 才能恢复。
+			return nil, fmt.Errorf("%w: session revoked (cross-origin-cookie 401)", ErrAuth)
+		}
+		if !warmed {
+			// A cold get-session (the cookie cache was never refreshed) answers null
+			// for healthy accounts too — temporary, never a reason to kill the account.
+			return nil, fmt.Errorf("%w: get-session 200 without accessToken (no warmup): %s", ErrTemporaryUpstream, clip(body, 160))
+		}
+		// No bearer despite 200 → the cookie no longer authenticates. Carry the body
+		// so the log says WHICH shape it was (null session vs a session without a
+		// token) instead of a bare "auth failed".
+		return nil, fmt.Errorf("%w: get-session 200 without accessToken: %s", ErrAuth, clip(body, 160))
 	}
 	uid := raw.Session.UserID
 	if uid == "" {
@@ -162,6 +333,7 @@ func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error
 		Email:       strings.TrimSpace(raw.User.Email),
 		Name:        strings.TrimSpace(raw.User.Name),
 		ExpiresAt:   raw.Session.TokenExpiry,
+		Cookie:      send,
 	}
 	if sess.ExpiresAt > time.Now().Unix() {
 		c.mu.Lock()
@@ -169,6 +341,162 @@ func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error
 		c.mu.Unlock()
 	}
 	return sess, nil
+}
+
+// refreshGate returns the per-cookie lock that serialises get-session refreshes.
+func (c *Client) refreshGate(cookie string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	gate, ok := c.refreshing[cookie]
+	if !ok {
+		gate = &sync.Mutex{}
+		c.refreshing[cookie] = gate
+	}
+	return gate
+}
+
+// warmSession calls cross-origin-cookie, whose response refreshes better-auth's
+// cookie cache and CF_Access_Token. It returns the Set-Cookie headers; a
+// checkpoint answer (403/429) is an error, since get-session would then be cold.
+func (c *Client) warmSession(ctx context.Context, client tlsclient.HttpClient, cookie string) ([]string, int, error) {
+	req, err := http.NewRequest(http.MethodGet, appBase+"/api/auth/cross-origin-cookie", nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req = req.WithContext(ctx)
+	req.Header = sessionHeader(cookie)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode == 403 || resp.StatusCode == 429 {
+		return nil, resp.StatusCode, fmt.Errorf("cross-origin-cookie http %d", resp.StatusCode)
+	}
+	return resp.Header["Set-Cookie"], resp.StatusCode, nil
+}
+
+// fetchSession performs one get-session call and returns its status, body and
+// Set-Cookie headers.
+func (c *Client) fetchSession(ctx context.Context, client tlsclient.HttpClient, cookie string) (int, []byte, []string, error) {
+	req, err := http.NewRequest(http.MethodGet, appBase+"/api/auth/get-session", nil)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	req = req.WithContext(ctx)
+	req.Header = sessionHeader(cookie)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, resp.Header["Set-Cookie"], nil
+}
+
+// sessionAccessToken pulls the bearer out of a get-session body; "" means the
+// answer carried none (a null session, or a session without a token).
+func sessionAccessToken(body []byte) string {
+	var raw struct {
+		Session struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"session"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(raw.Session.AccessToken)
+}
+
+// sessionHeader is the auth endpoints' request shape, copied from a real
+// browser's call (HAR): a same-origin GET carries NO origin header and DOES
+// carry the ua client hints + priority — sending origin while omitting the
+// hints is exactly the shape Vercel's checkpoint 429s.
+func sessionHeader(cookie string) http.Header {
+	return http.Header{
+		"accept":             {"*/*"},
+		"accept-language":    {"en-US,en;q=0.9"},
+		"cache-control":      {"no-cache"},
+		"cookie":             {cookie},
+		"pragma":             {"no-cache"},
+		"priority":           {"u=1, i"},
+		"referer":            {appBase + "/"},
+		"sec-ch-ua":          {secChUA},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {`"Windows"`},
+		"sec-fetch-dest":     {"empty"},
+		"sec-fetch-mode":     {"cors"},
+		"sec-fetch-site":     {"same-origin"},
+		"user-agent":         {userAgent},
+		http.HeaderOrderKey: {
+			"accept", "accept-language", "cache-control", "cookie", "pragma",
+			"priority", "referer", "sec-ch-ua", "sec-ch-ua-mobile",
+			"sec-ch-ua-platform", "sec-fetch-dest", "sec-fetch-mode",
+			"sec-fetch-site", "user-agent",
+		},
+	}
+}
+
+// session returns the cookie's access token, optionally forcing a fresh mint
+// (dropping the cache) — used when the upstream rejected the current bearer.
+func (c *Client) session(ctx context.Context, cookie string, force bool) (*Session, error) {
+	if force {
+		c.mu.Lock()
+		delete(c.sessions, strings.TrimSpace(cookie))
+		c.mu.Unlock()
+	}
+	return c.GetSession(ctx, cookie)
+}
+
+// ProbeSession force-mints a session from the cookie, bypassing the cached
+// bearer. Callers use it to double-check an auth failure before killing an
+// account: a rejected bearer (rotation race / expired token) still yields a
+// working cookie here, only a genuinely dead cookie returns ErrAuth.
+func (c *Client) ProbeSession(ctx context.Context, cookie string) (*Session, error) {
+	return c.session(ctx, cookie, true)
+}
+
+// callGraphQL runs one GraphQL call for an account cookie. The bearer only lives
+// ~1h, so a rejected token (401/403 or a JWTExpired GraphQL error) is re-minted
+// from the cookie and the call retried once. Only a cookie that itself stops
+// authenticating yields ErrAuth — an upstream bearer rejection stays temporary so
+// the account is never killed for it.
+func (c *Client) callGraphQL(ctx context.Context, cookie string, payload []byte, useProxy bool, label string) ([]byte, error) {
+	var lastStatus int
+	var lastBody []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		sess, err := c.session(ctx, cookie, attempt > 0)
+		if err != nil {
+			return nil, err
+		}
+		body, status, err := c.graphqlP(ctx, sess.AccessToken, payload, useProxy)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: %s", ErrTemporaryUpstream, label, err.Error())
+		}
+		lastStatus, lastBody = status, body
+		stale := status == 401 || status == 403
+		var gqlErr error
+		if !stale && status == 200 {
+			gqlErr = graphqlError(body)
+			stale = errors.Is(gqlErr, ErrAuth)
+		}
+		if stale {
+			if attempt == 0 {
+				continue
+			}
+			break
+		}
+		if status != 200 {
+			return nil, fmt.Errorf("%w: %s http %d: %s", ErrTemporaryUpstream, label, status, clip(body, 160))
+		}
+		if gqlErr != nil {
+			return nil, gqlErr
+		}
+		return body, nil
+	}
+	return nil, fmt.Errorf("%w: %s rejected a freshly minted bearer (http %d): %s",
+		ErrTemporaryUpstream, label, lastStatus, clip(lastBody, 160))
 }
 
 const qGetTokens = `query GetUserTokensFromSub($sub: String) {
@@ -205,15 +533,12 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 		"variables":     map[string]any{"sub": sess.CognitoSub},
 		"query":         qGetTokens,
 	})
-	body, status, err := c.graphqlP(ctx, sess.AccessToken, payload, false)
+	body, err := c.callGraphQL(ctx, cookie, payload, false, "credits")
 	if err != nil {
-		return unknownBalance("network: " + err.Error()), nil
-	}
-	if status == 401 || status == 403 {
-		return nil, ErrAuth
-	}
-	if status != 200 {
-		return unknownBalance(fmt.Sprintf("http %d: %s", status, clip(body, 160))), nil
+		if errors.Is(err, ErrAuth) {
+			return nil, ErrAuth
+		}
+		return unknownBalance(err.Error()), nil
 	}
 	var result struct {
 		Data struct {
@@ -248,13 +573,8 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 	}, nil
 }
 
-// graphql runs a GraphQL call through the proxy. graphqlP lets callers pick the
-// egress: only the generate submit uses the proxy; reference-image upload and
-// polling run direct (local IP).
-func (c *Client) graphql(ctx context.Context, accessToken string, payload []byte) ([]byte, int, error) {
-	return c.graphqlP(ctx, accessToken, payload, true)
-}
-
+// graphqlP runs a GraphQL call; callers pick the egress: only the generate submit
+// uses the proxy; reference-image upload and polling run direct (local IP).
 func (c *Client) graphqlP(ctx context.Context, accessToken string, payload []byte, useProxy bool) ([]byte, int, error) {
 	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
@@ -270,7 +590,11 @@ func (c *Client) graphqlP(ctx context.Context, accessToken string, payload []byt
 		"accept":               {"*/*"},
 		"accept-language":      {"en-US,en;q=0.9"},
 		"origin":               {appBase},
+		"priority":             {"u=1, i"},
 		"referer":              {appBase + "/"},
+		"sec-ch-ua":            {secChUA},
+		"sec-ch-ua-mobile":     {"?0"},
+		"sec-ch-ua-platform":   {`"Windows"`},
 		"user-agent":           {userAgent},
 		"authorization":        {"Bearer " + accessToken},
 		"x-leo-schema-version": {schemaVersion},
@@ -278,7 +602,8 @@ func (c *Client) graphqlP(ctx context.Context, accessToken string, payload []byt
 		"sec-fetch-mode":       {"cors"},
 		"sec-fetch-site":       {"same-site"},
 		http.HeaderOrderKey: {
-			"content-type", "accept", "accept-language", "origin", "referer",
+			"content-type", "accept", "accept-language", "origin", "priority",
+			"referer", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
 			"user-agent", "authorization", "x-leo-schema-version",
 			"sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
 		},
