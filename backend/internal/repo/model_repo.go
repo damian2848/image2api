@@ -38,7 +38,10 @@ func (r *ModelRepository) List(ctx context.Context) ([]model.ModelConfig, error)
 
 func (r *ModelRepository) Get(ctx context.Context, modelID string) (*model.ModelConfig, error) {
 	var item model.ModelConfig
-	if err := r.db.WithContext(ctx).First(&item, "(alias <> '' AND alias = ?) OR (alias = '' AND id = ?)", modelID, modelID).Error; err != nil {
+	// Event logs persist the canonical model ID, while public requests may use
+	// the configured alias. Both identifiers must keep resolving even when a
+	// model has an alias, otherwise durable queue workers cannot resume it.
+	if err := r.db.WithContext(ctx).First(&item, "id = ? OR (alias <> '' AND alias = ?)", modelID, modelID).Error; err != nil {
 		return nil, err
 	}
 	return &item, nil
