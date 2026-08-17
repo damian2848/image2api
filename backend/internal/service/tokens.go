@@ -56,6 +56,11 @@ type TokenService struct {
 	// 10-worker _quota_check_pool) so a big paste doesn't fire hundreds of
 	// simultaneous upstream requests.
 	sem chan struct{}
+	// adobeImportMu makes the check-and-create path for an Adobe cookie, and the
+	// later email-based reconciliation, atomic within this process. Without it,
+	// identical entries in one bulk paste can both land as pending rows before
+	// either background probe records the account email.
+	adobeImportMu sync.Mutex
 	// kreaActivating guards the once-per-day krea /app activation sweep so the 60s
 	// maintenance tick can't pile up overlapping sweeps.
 	kreaActivating atomic.Bool
@@ -725,6 +730,26 @@ func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID st
 	if cookie == "" {
 		return nil, nil, errors.New("cookie required")
 	}
+	// Adobe access tokens are minted asynchronously, so the refresh profile is
+	// the only durable place where an incoming cookie can be compared before the
+	// email is known. Reuse its matching account instead of adding another pending
+	// row when a cookie is pasted again.
+	s.adobeImportMu.Lock()
+	defer s.adobeImportMu.Unlock()
+	if existingProfile, err := s.refresh.GetByPoolCookie(ctx, "adobe", cookie); err != nil {
+		return nil, nil, err
+	} else if existingProfile != nil {
+		item, err := s.tokens.Get(ctx, "adobe", existingProfile.ID)
+		if err == nil {
+			return item, existingProfile, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, err
+		}
+		// Repair a legacy orphaned refresh profile by restoring its matching
+		// account id instead of creating a second profile for the same cookie.
+		tokenID = existingProfile.ID
+	}
 	if tokenID == "" {
 		tokenID = newTokenID("adobe")
 	}
@@ -802,14 +827,32 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 		})
 		return
 	}
+	// Resolve the logical account identity before writing quota state. Some Adobe
+	// tokens carry an email claim, while others require the profile endpoint.
+	email, exp := parseJWTEmailExpiry(result.AccessToken)
+	profile, profileErr := s.adobe.FetchAccountProfile(ctx, result.AccessToken)
+	if profileErr == nil {
+		if profileEmail := strings.TrimSpace(stringValue(profile["email"])); profileEmail != "" {
+			email = profileEmail
+		}
+	}
+	// A refreshed cookie can differ from the stored one, so exact-cookie matching
+	// at request time is insufficient. Once identity is known, retain the older
+	// account row and replace its refresh cookie with this verified credential.
+	tokenID, mergedIntoExisting := s.reconcileAdobeImport(ctx, tokenID, cookie, email)
+
 	// Seed the real access token, then activate so the pool can schedule it.
 	seed := map[string]any{"value": result.AccessToken}
-	email, exp := parseJWTEmailExpiry(result.AccessToken)
 	if email != "" {
 		seed["account_email"] = email
 	}
 	if exp != nil {
 		seed["cached_quota_reset_after"] = exp.Format(time.RFC3339)
+	}
+	if profileErr == nil {
+		if displayName := strings.TrimSpace(stringValue(profile["display_name"])); displayName != "" {
+			seed["account_display_name"] = displayName
+		}
 	}
 	_, _ = s.tokens.Update(ctx, "adobe", tokenID, seed)
 
@@ -862,22 +905,15 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 		}
 		_, _ = s.tokens.Update(ctx, "adobe", tokenID, patch)
 	}
-	if prof, e := s.adobe.FetchAccountProfile(ctx, result.AccessToken); e == nil {
-		p := map[string]any{}
-		if em := strings.TrimSpace(stringValue(prof["email"])); em != "" {
-			p["account_email"] = em
-		}
-		if dn := strings.TrimSpace(stringValue(prof["display_name"])); dn != "" {
-			p["account_display_name"] = dn
-		}
-		if len(p) > 0 {
-			_, _ = s.tokens.Update(ctx, "adobe", tokenID, p)
-		}
-	}
-
 	// 探测不到会员身份（credits 接口失败或没返回 plan）的号既不算普号也不算会员号，
 	// 留在池里只会在需要会员的请求上撞 403 —— 直接置死号，等重新探测到 plan 再启用。
 	if !planKnown {
+		if mergedIntoExisting {
+			// The existing account had already passed a quota probe. A transient
+			// failure while validating a newer cookie must not turn that working
+			// account into a dead one.
+			return
+		}
 		log.Printf("token import: adobe %s plan unknown, marking dead", tokenID)
 		s.finishPending(ctx, "adobe", tokenID, "disabled", true, quotaMeta)
 		return
@@ -890,6 +926,80 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 		"consecutive_failures": 0,
 		"next_retry_at":        time.Now().Add(54000 * time.Second),
 	})
+}
+
+// reconcileAdobeImport collapses a newly-probed Adobe row into the existing
+// account with the same email. The incoming cookie has already authenticated,
+// so it is safe to make it the stored refresh credential. The older account id
+// remains canonical, preserving its weight, counters, and other admin settings.
+func (s *TokenService) reconcileAdobeImport(ctx context.Context, tokenID, cookie, email string) (string, bool) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return tokenID, false
+	}
+
+	s.adobeImportMu.Lock()
+	defer s.adobeImportMu.Unlock()
+
+	existing, err := s.tokens.GetByPoolEmail(ctx, "adobe", email)
+	if err != nil {
+		log.Printf("token import: adobe %s email dedup lookup failed: %v", tokenID, err)
+		return tokenID, false
+	}
+	if existing == nil || existing.ID == tokenID {
+		// Persist the identity while holding the lock. A concurrent probe for the
+		// same account will then see this row and reuse it.
+		if _, err := s.tokens.Update(ctx, "adobe", tokenID, map[string]any{"account_email": email}); err != nil {
+			log.Printf("token import: adobe %s email write failed: %v", tokenID, err)
+		}
+		return tokenID, false
+	}
+
+	// The old account needs a refresh profile too: manually added legacy Adobe
+	// tokens might not have one, while normal cookie imports always do.
+	now := time.Now()
+	nextRetry := now.Add(54000 * time.Second)
+	if _, err := s.refresh.Update(ctx, existing.ID, map[string]any{
+		"cookie":               cookie,
+		"enabled":              true,
+		"imported_at":          &now,
+		"last_error":           "",
+		"consecutive_failures": 0,
+		"next_retry_at":        &nextRetry,
+	}); err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Printf("token import: adobe %s refresh profile update failed: %v", existing.ID, err)
+			return tokenID, false
+		}
+		profile := &model.RefreshProfile{
+			ID:              existing.ID,
+			Name:            existing.ID,
+			Pool:            "adobe",
+			Kind:            "adobe_cookie",
+			Cookie:          cookie,
+			Enabled:         true,
+			IntervalSeconds: 54000,
+			ImportedAt:      &now,
+			NextRetryAt:     &nextRetry,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		if err := s.refresh.Create(ctx, profile); err != nil {
+			log.Printf("token import: adobe %s refresh profile create failed: %v", existing.ID, err)
+			return tokenID, false
+		}
+	}
+
+	// Drop only the transient row and its profile. The rest of this probe writes
+	// the fresh access token, quota and status to the canonical existing account.
+	if _, err := s.tokens.Delete(ctx, "adobe", tokenID); err != nil {
+		log.Printf("token import: adobe duplicate %s delete failed: %v", tokenID, err)
+		return tokenID, false
+	}
+	if err := s.refresh.Delete(ctx, tokenID); err != nil {
+		log.Printf("token import: adobe duplicate profile %s delete failed: %v", tokenID, err)
+	}
+	return existing.ID, true
 }
 
 // checkPendingChatGPT probes a freshly imported ChatGPT token's quota off-thread
