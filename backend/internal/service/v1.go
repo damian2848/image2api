@@ -108,6 +108,9 @@ type V1Service struct {
 	// of fails/last_used. The atomic counter also serializes concurrent picks so
 	// two simultaneous requests never start on the same account.
 	tokenCursors sync.Map
+	// adobeProxySessionSeq is the process-local fallback for task-level sticky
+	// proxy grouping when Redis is unavailable.
+	adobeProxySessionSeq atomic.Uint64
 
 	// inflight maps an in-progress event ID → the cancel func of its generation
 	// work context, so the maintenance sweep can stop a stuck generation the
@@ -1931,31 +1934,36 @@ const (
 	// + download), not merely for the initial HTTP submit. This is the real
 	// capacity control: a burst waits locally instead of filling Adobe's render
 	// queue and learning about overload a minute later.
-	adobeRenderInitialConcurrency   = 4
-	adobeRenderMinConcurrency       = 1
+	adobeRenderInitialConcurrency   = 12
+	adobeRenderMinConcurrency       = 4
 	adobeRenderMaxConcurrency       = 32
-	adobeRenderSuccessesPerIncrease = 8
+	adobeRenderSuccessesPerIncrease = 4
 	adobeRenderAcquirePoll          = 200 * time.Millisecond
 	adobeRenderAdaptiveTTL          = time.Hour
 
 	// A short static submit gate still smooths starts after render capacity grows.
-	adobeSubmitBurstConcurrency = 4
+	adobeSubmitBurstConcurrency = 8
 	adobeSubmitMinLease         = time.Second
 	adobeSubmitAcquirePoll      = 100 * time.Millisecond
 
 	adobeOverloadRetries       = 2
 	adobeOverloadRetryBase     = 10 * time.Second
+	adobeProxyTransportRetries = 2
+	adobeProxyTransportDelay   = time.Second
 	adobeOverloadWindow        = 2 * time.Minute
-	adobeOverloadTripThreshold = 3
-	adobeOverloadBasePause     = 15 * time.Second
+	adobeOverloadTripThreshold = 8
+	adobeOverloadBasePause     = 10 * time.Second
 	adobeOverloadMaxPause      = time.Minute
 
-	adobeRenderSlotsKeyPrefix    = "conc:p:adobe:render:"
-	adobeRenderLimitKeyPrefix    = "limit:p:adobe:render:"
-	adobeRenderSuccessKeyPrefix  = "success:p:adobe:render:"
-	adobeRenderOverloadKeyPrefix = "overload:p:adobe:render:"
-	adobeRenderCooldownKeyPrefix = "pause:p:adobe:render:"
-	adobeSubmitSlotsKeyPrefix    = "conc:p:adobe:submit:"
+	// v2 starts with clean adaptive state after introducing independent proxy
+	// sessions; the old single-exit limit may be pinned at one for an hour.
+	adobeRenderSlotsKeyPrefix    = "conc:p:adobe:render:v2:"
+	adobeRenderLimitKeyPrefix    = "limit:p:adobe:render:v2:"
+	adobeRenderSuccessKeyPrefix  = "success:p:adobe:render:v2:"
+	adobeRenderOverloadKeyPrefix = "overload:p:adobe:render:v2:"
+	adobeRenderCooldownKeyPrefix = "pause:p:adobe:render:v2:"
+	adobeSubmitSlotsKeyPrefix    = "conc:p:adobe:submit:v2:"
+	adobeProxySubmitKeyPrefix    = "conc:p:adobe:proxy-submit:v1:"
 )
 
 // maxTempDeadAccounts caps how many accounts an account/network-specific
@@ -2115,10 +2123,11 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 			})
 			return data, nil, false, false
 		}
-		// Adobe capacity errors are endpoint pressure, not account faults. A job
-		// overload is especially important: Adobe already accepted one render, so
-		// failing over would create duplicates and amplify the overloaded queue.
-		if isAdobeCapacityOverload(err) {
+		// Adobe capacity and submit-transport errors are route/endpoint faults, not
+		// account faults. The image path has already retried transport failures on
+		// fresh proxy sessions; sweeping accounts on the final error would only send
+		// more traffic through a broken route.
+		if isAdobeCapacityOverload(err) || errors.Is(err, adobe.ErrSubmitTransport) {
 			return nil, err, false, false
 		}
 		isAuth, isQuota, isTemp, isDead := classify(err)
@@ -2313,10 +2322,23 @@ type adobeSubmitLease struct {
 	finish func(error)
 }
 
-func (s *V1Service) acquireAdobeSubmitLease(ctx context.Context, eventID, bucket string) (*adobeSubmitLease, error) {
+func (s *V1Service) acquireAdobeSubmitLease(ctx context.Context, eventID, bucket, proxySession string) (*adobeSubmitLease, error) {
 	slotsKey := adobeSubmitKey(adobeSubmitSlotsKeyPrefix, bucket)
 	slotToken := eventID + "-submit-" + randomUpper(8)
+	proxySlotsKey := ""
+	if proxySession != "" {
+		proxySlotsKey = adobeProxySubmitKeyPrefix + proxySession
+		// Serialize the first connections for a new sticky SID. 1024Proxy can
+		// assign different exits when several requests initialize one SID at the
+		// exact same instant; after the first submit, later jobs share its exit.
+		if err := s.conc.AcquireWait(ctx, proxySlotsKey, 1, slotToken, adobeSubmitAcquirePoll); err != nil {
+			return nil, err
+		}
+	}
 	if err := s.conc.AcquireWait(ctx, slotsKey, adobeSubmitBurstConcurrency, slotToken, adobeSubmitAcquirePoll); err != nil {
+		if proxySlotsKey != "" {
+			s.conc.Release(context.WithoutCancel(ctx), proxySlotsKey, slotToken)
+		}
 		return nil, err
 	}
 	acquiredAt := time.Now()
@@ -2326,14 +2348,18 @@ func (s *V1Service) acquireAdobeSubmitLease(ctx context.Context, eventID, bucket
 			if remaining := adobeSubmitMinLease - time.Since(acquiredAt); remaining > 0 {
 				time.Sleep(remaining)
 			}
-			s.conc.Release(context.WithoutCancel(ctx), slotsKey, slotToken)
+			bookkeepingCtx := context.WithoutCancel(ctx)
+			s.conc.Release(bookkeepingCtx, slotsKey, slotToken)
+			if proxySlotsKey != "" {
+				s.conc.Release(bookkeepingCtx, proxySlotsKey, slotToken)
+			}
 		})
 	}}, nil
 }
 
-func (s *V1Service) adobeSubmitPermit(eventID, bucket string) adobe.SubmitPermit {
+func (s *V1Service) adobeSubmitPermit(eventID, bucket, proxySession string) adobe.SubmitPermit {
 	return func(ctx context.Context) (func(error), error) {
-		lease, err := s.acquireAdobeSubmitLease(ctx, eventID, bucket)
+		lease, err := s.acquireAdobeSubmitLease(ctx, eventID, bucket, proxySession)
 		if err != nil {
 			return nil, err
 		}
@@ -2364,17 +2390,37 @@ func adobeOverloadJitter(eventID string, attempt int) time.Duration {
 	return time.Duration(hash%5000) * time.Millisecond
 }
 
-func (s *V1Service) generateAdobeImageWithOverloadRetry(ctx context.Context, eventID string, token model.TokenAccount, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, blobIDs []string, downloadResult bool, submitPermit adobe.SubmitPermit, renderPermit adobeRenderPermit) ([]byte, map[string]any, error) {
+func (s *V1Service) generateAdobeImageWithOverloadRetry(ctx context.Context, eventID string, token model.TokenAccount, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, blobIDs []string, downloadResult bool, baseProxy, submitProxy, proxySession string, renderPermit adobeRenderPermit) ([]byte, map[string]any, error) {
 	bucket := adobeSubmitBucket(modelItem.ID)
-	for attempt := 0; ; attempt++ {
+	overloadAttempts := 0
+	transportAttempts := 0
+	for {
 		renderLease, acquireErr := renderPermit(ctx)
 		if acquireErr != nil {
 			return nil, nil, acquireErr
 		}
-		data, meta, err := s.adobe.GenerateImageWithSubmitPermit(
+		submitPermit := s.adobeSubmitPermit(eventID, bucket, proxySession)
+		data, meta, err := s.adobe.GenerateImageWithProxyAndSubmitPermit(
 			ctx, token.Value, modelItem.ID, in.Prompt, aspectRatio, resolution, blobIDs, downloadResult,
-			submitPermit,
+			submitProxy, submitPermit,
 		)
+		if errors.Is(err, adobe.ErrSubmitTransport) {
+			renderLease.finish(false)
+			if transportAttempts >= adobeProxyTransportRetries || ctx.Err() != nil {
+				return data, meta, err
+			}
+			transportAttempts++
+			nextProxy, nextSession := s.adobeProxyForFreshSession(ctx, baseProxy, proxySession)
+			if nextSession == "" || nextProxy == submitProxy {
+				return data, meta, err
+			}
+			log.Printf("adobe proxy session rotated: event=%s from=%s to=%s reason=transport", eventID, proxySession, nextSession)
+			submitProxy, proxySession = nextProxy, nextSession
+			if waitErr := waitForAdobeRetry(ctx, adobeProxyTransportDelay); waitErr != nil {
+				return nil, nil, waitErr
+			}
+			continue
+		}
 		if !isAdobeCapacityOverload(err) {
 			renderLease.finish(err == nil)
 			return data, meta, err
@@ -2385,10 +2431,11 @@ func (s *V1Service) generateAdobeImageWithOverloadRetry(ctx context.Context, eve
 		}
 		s.recordAdobeCapacityOverload(ctx, bucket, phase)
 		renderLease.finish(false)
-		if attempt >= adobeOverloadRetries {
+		if overloadAttempts >= adobeOverloadRetries {
 			return data, meta, err
 		}
-		delay := adobeOverloadRetryBase*time.Duration(1<<attempt) + adobeOverloadJitter(eventID, attempt)
+		delay := adobeOverloadRetryBase*time.Duration(1<<overloadAttempts) + adobeOverloadJitter(eventID, overloadAttempts)
+		overloadAttempts++
 		if waitErr := waitForAdobeRetry(ctx, delay); waitErr != nil {
 			return nil, nil, waitErr
 		}
@@ -2415,9 +2462,10 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 	if s.adobe == nil {
 		return nil, "", errors.New("adobe client not configured")
 	}
+	var baseProxy string
 	if s.settings != nil {
 		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.adobe.SetProxy(proxy)
+			baseProxy = proxy
 		}
 	}
 
@@ -2461,8 +2509,13 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 		return nil, "", err
 	}
 	defer cancelUnusedRender()
-	submitPermit := s.adobeSubmitPermit(eventID, bucket)
-
+	// Allocate the sticky session only after this task owns render capacity. This
+	// keeps the three tasks in a SID group close together even when the worker
+	// queue waits longer than the proxy's configured sticky duration.
+	submitProxy, proxySession := s.adobeProxyForTask(ctx, baseProxy)
+	if proxySession != "" {
+		log.Printf("adobe proxy session assigned: event=%s session=%s tasks_per_session=%d", eventID, proxySession, adobeProxyTasksPerSession)
+	}
 	// Round-robin order. The endpoint render lease was acquired before any account
 	// slot, so burst waiters do not reserve accounts. Auth/quota and genuinely
 	// account-specific failures still fail over; capacity errors retry this account
@@ -2484,7 +2537,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 			}
 			blobIDs = append(blobIDs, id)
 		}
-		d, meta, genErr := s.generateAdobeImageWithOverloadRetry(ctx, eventID, token, modelItem, in, aspectRatio, resolution, blobIDs, !urlOnly, submitPermit, renderPermit)
+		d, meta, genErr := s.generateAdobeImageWithOverloadRetry(ctx, eventID, token, modelItem, in, aspectRatio, resolution, blobIDs, !urlOnly, baseProxy, submitProxy, proxySession, renderPermit)
 		if genErr == nil {
 			imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
 		}

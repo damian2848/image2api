@@ -45,6 +45,11 @@ var (
 	// poll URL. It is endpoint admission pressure rather than evidence of an
 	// account failure, so callers should pace instead of fanning out across tokens.
 	ErrSubmitOverloaded = fmt.Errorf("%w: submit system under load", ErrTemporaryUpstream)
+	// ErrSubmitTransport is a connection/TLS failure before Adobe returned a
+	// response. A caller using rotating residential proxies may safely retry the
+	// same account through a fresh sticky session instead of burning more accounts
+	// on the same broken exit.
+	ErrSubmitTransport = fmt.Errorf("%w: submit transport failure", ErrTemporaryUpstream)
 	// ErrJobOverloaded means Adobe accepted the job but the asynchronous render
 	// later failed under load. Retrying other accounts would create duplicate jobs
 	// and amplify pressure, so callers must treat it as endpoint capacity feedback.
@@ -286,11 +291,22 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 // control around each upstream submit. Polling and result download remain fully
 // concurrent after Adobe accepts the job.
 func (c *Client) GenerateImageWithSubmitPermit(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool, permit SubmitPermit) ([]byte, map[string]any, error) {
+	return c.generateImageWithProxyAndSubmitPermit(ctx, token, modelID, prompt, aspectRatio, resolution, blobIDs, downloadResult, c.proxyURL(), permit)
+}
+
+// GenerateImageWithProxyAndSubmitPermit uses a request-scoped proxy snapshot.
+// It lets concurrent tasks use independent sticky sessions without racing on
+// the client's global proxy, which remains the default for legacy callers.
+func (c *Client) GenerateImageWithProxyAndSubmitPermit(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool, proxy string, permit SubmitPermit) ([]byte, map[string]any, error) {
+	return c.generateImageWithProxyAndSubmitPermit(ctx, token, modelID, prompt, aspectRatio, resolution, blobIDs, downloadResult, strings.TrimSpace(proxy), permit)
+}
+
+func (c *Client) generateImageWithProxyAndSubmitPermit(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool, proxy string, permit SubmitPermit) ([]byte, map[string]any, error) {
 	// Only the generate submit goes through the proxy; polling + download run on
 	// the local IP.
-	submitSess, err := c.newTLSClient()
+	submitSess, err := c.newTLSClientWithProxy(proxy)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%w: %v", ErrSubmitTransport, err)
 	}
 	pollSess, err := c.newDirectTLSClient()
 	if err != nil {
@@ -641,7 +657,7 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 
 	resp, err := sess.client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+		return nil, "", fmt.Errorf("%w: %v", ErrSubmitTransport, err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
@@ -1115,21 +1131,25 @@ type tlsSession struct {
 // image-generation submit goes through the proxy; reference-image upload,
 // polling and result download run on the local IP.
 func (c *Client) newTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(randomFingerprint(), true)
+	return c.newTLSClientWithProxy(c.proxyURL())
+}
+
+func (c *Client) newTLSClientWithProxy(proxy string) (*tlsSession, error) {
+	return c.newTLSSessionWithProxy(randomFingerprint(), strings.TrimSpace(proxy))
 }
 
 func (c *Client) newDirectTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(randomFingerprint(), false)
+	return c.newTLSSessionWithProxy(randomFingerprint(), "")
 }
 
-func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, error) {
+func (c *Client) newTLSSessionWithProxy(fp fingerprint, proxy string) (*tlsSession, error) {
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(fp.profile),
 		tlsclient.WithNotFollowRedirects(),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if proxy := c.proxyURL(); useProxy && proxy != "" {
+	if proxy != "" {
 		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)

@@ -217,9 +217,9 @@ redis.call('SET', KEYS[1], current, 'PX', ttl)
 return current
 `)
 
-// adaptiveOverloadScript applies multiplicative decrease and counts overloads
-// in a short fixed window. The caller uses the count to decide whether this is
-// an isolated response or enough correlated pressure to open a circuit.
+// adaptiveOverloadScript applies a one-step decrease and counts overloads in a
+// short fixed window. With independent proxy exits, one bad route must not
+// halve capacity for every other route in the provider bucket.
 var adaptiveOverloadScript = redis.NewScript(`
 local initial = tonumber(ARGV[1])
 local minimum = tonumber(ARGV[2])
@@ -230,7 +230,7 @@ local current = tonumber(redis.call('GET', KEYS[1]))
 if not current then current = initial end
 if current < minimum then current = minimum end
 if current > maximum then current = maximum end
-current = math.floor(current / 2)
+current = current - 1
 if current < minimum then current = minimum end
 redis.call('SET', KEYS[1], current, 'PX', ttl)
 redis.call('DEL', KEYS[2])
@@ -291,8 +291,8 @@ func (c *ConcurrencyService) RecordAdaptiveSuccess(ctx context.Context, limitKey
 	return limit
 }
 
-// RecordAdaptiveOverload halves the current bucket limit and returns both the
-// new limit and the number of overloads observed inside the current window.
+// RecordAdaptiveOverload lowers the current bucket limit by one and returns
+// both the new limit and the number of overloads observed inside the window.
 func (c *ConcurrencyService) RecordAdaptiveOverload(ctx context.Context, limitKey, successKey, overloadKey string, initial, minimum, maximum int, window, ttl time.Duration) (int, int) {
 	initial, minimum, maximum = normalizeAdaptiveBounds(initial, minimum, maximum)
 	if c == nil || c.redis == nil {
@@ -309,6 +309,29 @@ func (c *ConcurrencyService) RecordAdaptiveOverload(ctx context.Context, limitKe
 		return initial, 1
 	}
 	return int(values[0]), int(values[1])
+}
+
+// NextSequence returns a distributed, monotonically increasing sequence value.
+// It is used for fair grouping where multiple service instances must agree on
+// the same allocation order. Redis failure is reported to the caller so it can
+// fall back to a process-local sequence without blocking request execution.
+func (c *ConcurrencyService) NextSequence(ctx context.Context, key string, ttl time.Duration) (int64, bool) {
+	if c == nil || c.redis == nil || key == "" {
+		return 0, false
+	}
+	pipe := c.redis.TxPipeline()
+	next := pipe.Incr(ctx, key)
+	if ttl > 0 {
+		pipe.Expire(ctx, key, ttl)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, false
+	}
+	value, err := next.Result()
+	if err != nil || value < 1 {
+		return 0, false
+	}
+	return value, true
 }
 
 // Count returns the live (non-expired) slot count under `key` — for display.

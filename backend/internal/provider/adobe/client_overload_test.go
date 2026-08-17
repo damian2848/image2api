@@ -36,6 +36,9 @@ func TestSubmitOverloadedWrapsTemporaryUpstream(t *testing.T) {
 	if !errors.Is(ErrJobOverloaded, ErrTemporaryUpstream) {
 		t.Fatal("job overload must remain a temporary upstream error")
 	}
+	if !errors.Is(ErrSubmitTransport, ErrTemporaryUpstream) {
+		t.Fatal("submit transport failure must remain a temporary upstream error")
+	}
 }
 
 func TestSubmitPermitReceivesAdobeSubmitResult(t *testing.T) {
