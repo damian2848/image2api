@@ -42,6 +42,7 @@ const search = ref('')
 const page = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
+const PAGE_SIZE_OPTIONS = [20, 50, 100, 200]
 // Typing a search term must jump back to page 1 and re-query the server —
 // search is cross-page now (server-side).
 let searchTimer = null
@@ -92,6 +93,11 @@ const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.v
 function goPage(n) {
   const target = Math.max(1, Math.min(totalPages.value, n))
   if (target !== page.value) page.value = target
+}
+function setPageSize(size) {
+  if (!PAGE_SIZE_OPTIONS.includes(size) || size === pageSize.value) return
+  pageSize.value = size
+  resetAndLoad()
 }
 function setFilter(fn) { fn(); resetAndLoad() }
 function resetAndLoad() {
@@ -618,17 +624,47 @@ onMounted(() => { loadAccounts(); loadModelList() })
       </table>
 
       <!-- pagination -->
-      <div v-if="!loading && totalPages > 1"
-           class="flex items-center justify-between gap-3 border-t border-white/[0.06] px-5 py-3 text-xs text-white/55">
-        <div>
+      <div v-if="!loading && total > 0"
+           class="flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.06] px-5 py-3 text-xs text-white/55">
+        <div class="flex flex-wrap items-center gap-3">
           <span class="tabular-nums text-white/85">{{ (page - 1) * pageSize + 1 }}–{{ Math.min(total, page * pageSize) }}</span>
           <span class="ml-1">/ {{ total }} 条</span>
+          <label class="flex items-center gap-1.5 whitespace-nowrap">
+            <span>每页</span>
+            <select
+              :value="pageSize"
+              class="page-size-select"
+              aria-label="每页展示账号数量"
+              @change="setPageSize(Number($event.target.value))"
+            >
+              <option v-for="size in PAGE_SIZE_OPTIONS" :key="size" :value="size">{{ size }}</option>
+            </select>
+            <span>条</span>
+          </label>
         </div>
-        <div class="flex items-center gap-1">
+        <div v-if="totalPages > 1" class="flex items-center gap-1">
+          <button
+            class="pg pg-nav"
+            :disabled="page === 1"
+            title="上一页"
+            aria-label="上一页"
+            @click="goPage(page - 1)"
+          >
+            &lsaquo;
+          </button>
           <template v-for="(n, i) in pageNumbers" :key="i">
             <span v-if="n === null" class="px-1 text-white/35">…</span>
             <button v-else @click="goPage(n)" class="pg" :class="page === n && 'pg-on'">{{ n }}</button>
           </template>
+          <button
+            class="pg pg-nav"
+            :disabled="page === totalPages"
+            title="下一页"
+            aria-label="下一页"
+            @click="goPage(page + 1)"
+          >
+            &rsaquo;
+          </button>
         </div>
       </div>
     </div>
@@ -779,4 +815,17 @@ onMounted(() => { loadAccounts(); loadModelList() })
 }
 .pg:hover:not(.pg-on) { background: rgb(255 255 255 / 0.1); color: white; }
 .pg-on { background: rgb(255 255 255 / 0.92); color: rgb(15 23 42); box-shadow: none; }
+.pg:disabled { cursor: not-allowed; opacity: 0.35; }
+.pg-nav { padding-inline: 0.45rem; font-size: 1.15rem; line-height: 1; }
+.page-size-select {
+  min-width: 3.75rem;
+  border: 0;
+  border-radius: 0.4rem;
+  padding: 0.3rem 1.35rem 0.3rem 0.5rem;
+  color: rgb(255 255 255 / 0.9);
+  background: rgb(255 255 255 / 0.06);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.1);
+}
+.page-size-select:focus { outline: 2px solid rgb(192 132 252 / 0.8); outline-offset: 2px; }
+.page-size-select option { color: rgb(15 23 42); background: white; }
 </style>
